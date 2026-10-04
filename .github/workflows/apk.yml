@@ -178,6 +178,10 @@ jobs:
           import android.content.Intent;
           import android.net.Uri;
           import android.os.Bundle;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.widget.Toast;
+          import java.io.OutputStream;
           import android.webkit.CookieManager;
           import android.webkit.WebChromeClient;
           import android.webkit.WebResourceRequest;
@@ -188,8 +192,64 @@ jobs:
           /** Abre o site do Orçamento numa tela própria. Dados, login e modo offline ficam no site
               (service worker + Firestore), guardados no armazenamento deste app. */
           public class MainActivity extends Activity {
+              private static final int SAVE_REQ = 42;
+              private static final String PDF = "application/pdf";
+              private static final String XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
               private WebView web;
               private String appHost;
+              private byte[] pendingBytes;
+              private String pendingMime;
+
+              /** Exportar PDF/Excel: o site gera o arquivo e chama OrcAndroid.saveFile(nome, tipo, base64).
+                  O Android pergunta onde salvar (Downloads, Drive...) e depois oferece abrir. */
+              private class Bridge {
+                  @JavascriptInterface
+                  public void saveFile(final String name, final String mime, final String b64) {
+                      runOnUiThread(() -> {
+                          try {
+                              String cur = web.getUrl();
+                              if (cur == null || appHost == null || !appHost.equalsIgnoreCase(Uri.parse(cur).getHost())) return;
+                              if (!PDF.equals(mime) && !XLSX.equals(mime)) return;
+                              if (b64 == null || b64.length() > 20000000) return;
+                              pendingBytes = Base64.decode(b64, Base64.DEFAULT);
+                              pendingMime = mime;
+                              String safe = name == null ? "arquivo" : name.replaceAll("[^A-Za-z0-9._-]", "_");
+                              if (safe.length() > 80) safe = safe.substring(0, 80);
+                              Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                              i.addCategory(Intent.CATEGORY_OPENABLE);
+                              i.setType(mime);
+                              i.putExtra(Intent.EXTRA_TITLE, safe);
+                              startActivityForResult(i, SAVE_REQ);
+                          } catch (Exception e) {
+                              Toast.makeText(MainActivity.this, "Não deu para salvar o arquivo.", Toast.LENGTH_LONG).show();
+                          }
+                      });
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req != SAVE_REQ) return;
+                  byte[] b = pendingBytes;
+                  String mime = pendingMime;
+                  pendingBytes = null;
+                  if (res != RESULT_OK || data == null || data.getData() == null || b == null) return;
+                  Uri uri = data.getData();
+                  try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                      os.write(b);
+                  } catch (Exception e) {
+                      Toast.makeText(this, "Não deu para salvar o arquivo.", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  Toast.makeText(this, "Arquivo salvo", Toast.LENGTH_SHORT).show();
+                  try {
+                      Intent v = new Intent(Intent.ACTION_VIEW);
+                      v.setDataAndType(uri, mime);
+                      v.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                      startActivity(Intent.createChooser(v, "Abrir com"));
+                  } catch (Exception ignored) {}
+              }
 
               @Override
               protected void onCreate(Bundle saved) {
@@ -206,7 +266,7 @@ jobs:
                   s.setAllowFileAccess(false);
                   s.setAllowContentAccess(false);
                   s.setCacheMode(WebSettings.LOAD_DEFAULT);
-                  s.setUserAgentString(s.getUserAgentString() + " OrcamentoApp/1");
+                  s.setUserAgentString(s.getUserAgentString() + " OrcamentoApp/2");
                   CookieManager.getInstance().setAcceptCookie(true);
 
                   web.setWebViewClient(new WebViewClient() {
@@ -219,6 +279,7 @@ jobs:
                       }
                   });
                   web.setWebChromeClient(new WebChromeClient());
+                  web.addJavascriptInterface(new Bridge(), "OrcAndroid");
 
                   if (saved != null) web.restoreState(saved);
                   else web.loadUrl(url);
