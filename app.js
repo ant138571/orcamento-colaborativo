@@ -14,6 +14,8 @@ const fmtBRL = new Intl.NumberFormat("pt-BR", {style:"currency", currency:"BRL"}
 const r2 = n => Math.round(((Number(n) || 0) + Number.EPSILON) * 100) / 100;
 const money = n => fmtBRL.format(r2(n)).replace(/ /g, " ");
 const MAX_AMOUNT = 10000000;
+/* Versão mostrada em Ajustes. AO PUBLICAR: aumente aqui e o VERSION do sw.js (veja REFERENCIA.txt, seção 7). */
+const APP_VERSION = "6.0.1";
 function parseMoney(s){
   s = String(s ?? "").trim().replace(/[R$\s ]/g, "");
   if (!s) return NaN;
@@ -863,7 +865,8 @@ function viewSettings(){
     ${s("signOut", "Sair da conta", `Conectado como ${esc(S.email)} (${esc(nameOf(S.me))})`)}
     ${s("askLeave", "Sair do grupo", owner && act.length > 1 ? "Como administrador, você só sai quando for a última pessoa" : "Seus lançamentos continuam no histórico do grupo")}
   </div>
-  <div id="leaveBox"></div>`;
+  <div id="leaveBox"></div>
+  <p class="note" style="text-align:center;margin:18px 4px 4px">Orçamento colaborativo · versão ${esc(APP_VERSION)}</p>`;
 }
 
 /* ---------- folhas (sheets) ---------- */
