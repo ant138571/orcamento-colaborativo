@@ -493,16 +493,21 @@ function viewEnvelopes(){
    A barra mostra o que RESTA (cheia no início, esvazia com os gastos).
    O traço do ritmo anda da direita para a esquerda: barra à esquerda do traço = gastando mais rápido que o período passa. */
 const leftFrac = s => s.avail > 0 ? Math.max(0, Math.min(1, s.left / s.avail)) : 0;
+/* Estouro: quanto passou do disponível, em vermelho a partir da direita (sem disponível: barra toda vermelha). */
+const overFrac = s => s.left >= -0.004 ? 0 : s.avail > 0 ? Math.min(1, -s.left / s.avail) : 1;
+const fmtNum = new Intl.NumberFormat("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2});
+const plain = n => fmtNum.format(r2(n)).replace("-", "−");
 function envRow(e, s, frac){
   const sk = status(s, frac);
-  const w = leftFrac(s) * 100;
+  const w = leftFrac(s) * 100, ov = overFrac(s) * 100;
   const tick = frac > 0 && frac < 1 ? `<b style="left:calc(${((1 - frac) * 100).toFixed(1)}% - 1px)"></b>` : "";
   const who = e.type === "comum" ? "" : `<span class="od" style="${pc(e.owner)}" title="Pessoal de ${esc(nameOf(e.owner))}">${esc(initials(e.owner))}</span>`;
   return `<div class="env ${sk.k}">
     <button class="env-go" data-act="spendIn" data-id="${esc(e.id)}" aria-label="Lançar gasto em ${esc(e.name)}. Resta ${esc(money(s.left))} de ${esc(money(s.avail))}. ${sk.t}.">
       <span class="nm">${who}<span class="name">${esc(e.name)}</span></span>
-      <span class="amt num">${money(s.left)}</span>
-      <span class="bar ${sk.k}" aria-hidden="true"><i style="width:${w.toFixed(1)}%"></i>${tick}</span>
+      <span class="amt num">${plain(s.left)}</span>
+      <span class="bar ${sk.k}" aria-hidden="true">${w > 0 ? `<i style="width:${w.toFixed(1)}%"></i>` : ""}${ov > 0 ? `<i class="over" style="width:${ov.toFixed(1)}%"></i>` : ""}${tick}</span>
+      <span class="of num">${plain(s.avail)}</span>
     </button>
     <button class="env-more" data-act="openEnv" data-id="${esc(e.id)}" aria-label="Detalhes de ${esc(e.name)}"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button>
   </div>`;
