@@ -1,0 +1,295 @@
+# Monta o app Android (APK) do Orçamento colaborativo e publica para download.
+#
+# O APK é um app leve que abre o site do app numa tela própria (WebView), sem Chrome e
+# sem barra de endereço. O conteúdo vem do site: atualizar o site atualiza o app,
+# sem precisar de APK novo. O funcionamento offline é o mesmo do site (service worker
+# + cópia local do Firestore).
+#
+# Como usar: aba Actions › "App Android (APK)" › Run workflow. Ao terminar, o APK fica em
+#   https://github.com/<usuário>/<repositório>/releases/download/apk/orcamento.apk
+#
+# Assinatura: com os secrets ANDROID_KEYSTORE_B64 e ANDROID_KEYSTORE_PASSWORD
+# (Settings › Secrets and variables › Actions), todo APK sai com a mesma chave e
+# instala por cima do anterior. Sem eles, cada APK sai com uma chave nova e, para
+# trocar de versão, é preciso desinstalar o anterior.
+# Endereço do site: por padrão https://<usuário>.github.io/<repositório>/ ;
+# para outro endereço, crie a variável APP_URL (Settings › Secrets and variables › Actions › Variables).
+
+name: App Android (APK)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/apk.yml"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Endereço do app
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          CUSTOM_URL: ${{ vars.APP_URL }}
+        run: |
+          if [ -n "$CUSTOM_URL" ]; then URL="$CUSTOM_URL"; else URL="https://${OWNER,,}.github.io/${REPO}/?app=1"; fi
+          echo "APP_URL=$URL" >> "$GITHUB_ENV"
+          echo "::notice::O app vai abrir $URL"
+
+      - name: Gerar o projeto Android
+        run: |
+          set -e
+          P=android
+          J=$P/app/src/main/java/app/orcamento/colaborativo
+          R=$P/app/src/main/res
+          mkdir -p "$J" "$R/values" "$R/values-night" "$R/mipmap-xxxhdpi"
+          cp icon-192.png "$R/mipmap-xxxhdpi/ic_launcher.png"
+
+          cat > $P/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "orcamento"
+          include ":app"
+          EOF
+
+          cat > $P/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF
+
+          cat > $P/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          EOF
+
+          cat > $P/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          def vc = Integer.parseInt(System.getenv("VERSION_CODE") ?: "1")
+          android {
+              namespace 'app.orcamento.colaborativo'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'app.orcamento.colaborativo'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode vc
+                  versionName "1." + vc
+              }
+              signingConfigs {
+                  release {
+                      storeFile file(System.getenv("KS_FILE"))
+                      storePassword System.getenv("KS_PASS")
+                      keyAlias System.getenv("KS_ALIAS")
+                      keyPassword System.getenv("KS_PASS")
+                  }
+              }
+              buildTypes {
+                  release { minifyEnabled false; signingConfig signingConfigs.release }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              lint { checkReleaseBuilds false; abortOnError false }
+          }
+          EOF
+
+          cat > $P/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:theme="@style/AppTheme"
+                  android:allowBackup="false"
+                  android:usesCleartextTraffic="false">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:screenOrientation="portrait"
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > $R/values/strings.xml <<EOF
+          <resources>
+              <string name="app_name">Orçamento</string>
+              <string name="app_url" translatable="false">${APP_URL}</string>
+          </resources>
+          EOF
+
+          cat > $R/values/colors.xml <<'EOF'
+          <resources><color name="bg">#F2F5F3</color></resources>
+          EOF
+          cat > $R/values-night/colors.xml <<'EOF'
+          <resources><color name="bg">#0F1513</color></resources>
+          EOF
+
+          cat > $R/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:statusBarColor">@color/bg</item>
+                  <item name="android:windowLightStatusBar">true</item>
+              </style>
+          </resources>
+          EOF
+          cat > $R/values-night/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:statusBarColor">@color/bg</item>
+                  <item name="android:windowLightStatusBar">false</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > $J/MainActivity.java <<'EOF'
+          package app.orcamento.colaborativo;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.webkit.CookieManager;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          /** Abre o site do Orçamento numa tela própria. Dados, login e modo offline ficam no site
+              (service worker + Firestore), guardados no armazenamento deste app. */
+          public class MainActivity extends Activity {
+              private WebView web;
+              private String appHost;
+
+              @Override
+              protected void onCreate(Bundle saved) {
+                  super.onCreate(saved);
+                  String url = getString(R.string.app_url);
+                  appHost = Uri.parse(url).getHost();
+                  web = new WebView(this);
+                  setContentView(web);
+
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);        // localStorage e IndexedDB (cópia offline do Firestore)
+                  s.setDatabaseEnabled(true);
+                  s.setAllowFileAccess(false);
+                  s.setAllowContentAccess(false);
+                  s.setCacheMode(WebSettings.LOAD_DEFAULT);
+                  s.setUserAgentString(s.getUserAgentString() + " OrcamentoApp/1");
+                  CookieManager.getInstance().setAcceptCookie(true);
+
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                          Uri u = r.getUrl();
+                          if (u.getHost() != null && u.getHost().equalsIgnoreCase(appHost)) return false;
+                          try { startActivity(new Intent(Intent.ACTION_VIEW, u)); } catch (Exception ignored) {}
+                          return true;                     // links de fora abrem no navegador
+                      }
+                  });
+                  web.setWebChromeClient(new WebChromeClient());
+
+                  if (saved != null) web.restoreState(saved);
+                  else web.loadUrl(url);
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle out) {
+                  super.onSaveInstanceState(out);
+                  web.saveState(out);
+              }
+
+              /** Voltar: fecha a janela de baixo do app, se houver; senão volta a página ou sai. */
+              @Override
+              @SuppressWarnings("deprecation")
+              public void onBackPressed() {
+                  web.evaluateJavascript(
+                      "(function(){if(document.getElementById('scrim')){document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}));return 1;}return 0;})()",
+                      v -> { if (!"1".equals(v)) { if (web.canGoBack()) web.goBack(); else finish(); } });
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  web.onPause();
+                  CookieManager.getInstance().flush();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  web.onResume();
+              }
+          }
+          EOF
+
+      - name: Chave de assinatura
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS_SECRET: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -e
+          KS="$RUNNER_TEMP/orcamento.jks"
+          if [ -n "$KS_B64" ] && [ -n "$KS_PASS_SECRET" ]; then
+            echo "$KS_B64" | tr -d ' \n\r' | base64 -d > "$KS"
+            echo "KS_PASS=$KS_PASS_SECRET" >> "$GITHUB_ENV"
+            echo "::notice::APK assinado com a chave fixa: instala por cima da versão anterior."
+          else
+            PASS=$(openssl rand -hex 16)
+            echo "::add-mask::$PASS"
+            keytool -genkeypair -keystore "$KS" -storetype PKCS12 -storepass "$PASS" -keypass "$PASS" \
+              -alias orcamento -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Orcamento colaborativo" -noprompt
+            echo "KS_PASS=$PASS" >> "$GITHUB_ENV"
+            echo "::warning::Sem os secrets ANDROID_KEYSTORE_B64/ANDROID_KEYSTORE_PASSWORD: este APK usa uma chave nova. Para instalar uma versão futura será preciso desinstalar esta antes."
+          fi
+          echo "KS_FILE=$KS" >> "$GITHUB_ENV"
+          echo "KS_ALIAS=orcamento" >> "$GITHUB_ENV"
+
+      - name: Montar o APK
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+        run: gradle -p android assembleRelease --no-daemon --stacktrace
+
+      - name: Publicar para download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          cp android/app/build/outputs/apk/release/app-release.apk orcamento.apk
+          gh release delete apk --yes --cleanup-tag 2>/dev/null || true
+          gh release create apk orcamento.apk \
+            --target "${{ github.sha }}" \
+            --title "App Android (versão 1.${{ github.run_number }})" \
+            --notes "Baixe **orcamento.apk** no celular Android e abra o arquivo para instalar. O app abre $APP_URL numa tela própria, sem o Chrome. Atualizações do site chegam sozinhas; só é preciso baixar um APK novo quando esta página avisar."
+          echo "::notice::APK pronto: https://github.com/${{ github.repository }}/releases/download/apk/orcamento.apk"
