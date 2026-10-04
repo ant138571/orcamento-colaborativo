@@ -645,6 +645,20 @@ function viewLedger(){
      <div class="btnrow" style="margin-top:14px"><button class="btn" data-act="ledAdd" data-k="in">Adicionar renda</button><button class="btn danger" data-act="ledAdd" data-k="out">Adicionar despesa</button></div>`}`;
 }
 
+/* App Android (APK montado pelo GitHub Actions, .github/workflows/apk.yml): o link aparece em Ajustes
+   só para quem abre o app num navegador de Android publicado no GitHub Pages (dentro do APK, não). */
+const inApk = () => / OrcamentoApp\//.test(navigator.userAgent);
+function apkUrl(){
+  const h = location.hostname, seg = location.pathname.split("/").filter(Boolean)[0];
+  if (!/^[a-z0-9-]+\.github\.io$/i.test(h) || !seg || !/^[A-Za-z0-9._-]+$/.test(seg)) return null;
+  return `https://github.com/${h.split(".")[0]}/${seg}/releases/download/apk/orcamento.apk`;
+}
+function apkLink(){
+  const u = apkUrl();
+  if (!u || inApk() || !/Android/i.test(navigator.userAgent)) return "";
+  return `<a class="set" href="${esc(u)}" rel="noopener" style="color:inherit;text-decoration:none"><div class="grow"><div class="t">Baixar o app para Android</div><div class="s">Abre numa tela própria, sem o navegador. Depois de instalar, entre com a mesma conta.</div></div><span class="chev">›</span></a>`;
+}
+
 function viewSettings(){
   const cm = S.config.currentMonth;
   const s = (act, t, sub) => `<button class="set" data-act="${act}"><div class="grow"><div class="t">${t}</div><div class="s">${sub}</div></div><span class="chev">›</span></button>`;
@@ -673,6 +687,7 @@ function viewSettings(){
   </div>
   <h3 class="section-h">Conta</h3>
   <div class="list">
+    ${apkLink()}
     ${s("signOut", "Sair da conta", `Conectado como ${esc(S.email)} (${esc(nameOf(S.me))})`)}
     ${s("askLeave", "Sair do grupo", owner && act.length > 1 ? "Como administrador, você só sai quando for a última pessoa" : "Seus lançamentos continuam no histórico do grupo")}
   </div>
@@ -686,7 +701,7 @@ function openSheet(html, ctx){
   $("#sheetHost").innerHTML = `<div class="scrim" id="scrim"><div class="sheet" role="dialog" aria-modal="true"><div class="grab"></div>${html}</div></div>`;
   // foco na hora (ainda dentro do toque): é o que faz o iPhone abrir o teclado sozinho
   const first = $("#sheetHost").querySelector("[autofocus]");
-  if (first){ try { first.focus({preventScroll:true}); } catch {} setTimeout(() => { if (document.activeElement !== first && $("#sheetHost").contains(first)) first.focus(); }, 60); }
+  if (first){ try { first.focus({preventScroll:true}); } catch {} setTimeout(() => { const a = document.activeElement; if ((!a || a === document.body) && $("#sheetHost").contains(first)) first.focus(); }, 60); }
 }
 function closeSheet(){ $("#sheetHost").innerHTML = ""; sheetCtx = null; }
 function envOptions(sel){
