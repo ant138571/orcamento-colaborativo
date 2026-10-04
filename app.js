@@ -558,7 +558,8 @@ async function joinHousehold(code, myName){
   await P.profile().set({household:code}, {merge:true});
 }
 async function removeMember(id, self){
-  const upd = {["members." + id + ".removed"]: true, memberUids: firebase.firestore.FieldValue.arrayRemove(id)};
+  // kicked: removido pelo administrador (não pode voltar com o código); quem sai sozinho pode voltar
+  const upd = {["members." + id + ".removed"]: true, ...(self ? {} : {["members." + id + ".kicked"]: true}), memberUids: firebase.firestore.FieldValue.arrayRemove(id)};
   if (S.config.shares && id in S.config.shares) upd["shares." + id] = firebase.firestore.FieldValue.delete();
   const ok = await safe(P.config().update(upd));
   if (ok && self) await safe(P.profile().set({household:null}, {merge:true}));
