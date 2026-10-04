@@ -15,7 +15,7 @@ const r2 = n => Math.round(((Number(n) || 0) + Number.EPSILON) * 100) / 100;
 const money = n => fmtBRL.format(r2(n)).replace(/ /g, " ");
 const MAX_AMOUNT = 10000000;
 /* Versão mostrada em Ajustes. AO PUBLICAR: aumente aqui e o VERSION do sw.js (veja REFERENCIA.txt, seção 7). */
-const APP_VERSION = "6.1.0";
+const APP_VERSION = "6.2.0";
 function parseMoney(s){
   s = String(s ?? "").trim().replace(/[R$\s ]/g, "");
   if (!s) return NaN;
@@ -124,6 +124,7 @@ const linkedEnvId = itemId => "cx" + itemId;
 function cleanItem(i){
   if (!i || typeof i !== "object" || typeof i.id !== "string") return null;
   const out = {...i, kind: i.kind === "in" ? "in" : "out", name:String(i.name || "Sem nome").slice(0,60), amount: isFinite(Number(i.amount)) ? r2(i.amount) : 0, date: isISO(i.date) ? i.date : "", paid: !!i.paid};
+  if (!isKey(out.copiedFrom)) delete out.copiedFrom;      // item repetido do mês anterior, ainda não revisado
   if (out.kind === "in"){
     // renda: pessoal (só a dona vê) ou compartilhada (vira renda do grupo, com divisão própria)
     out.shared = !!i.shared; out.split = cleanSplit(i.split); if (!out.split) delete out.split;
@@ -358,9 +359,12 @@ async function copyLedgerFromPrev(target, silent){
     if (!prev.length){ if (!silent) toast(`${monthLabel(pk)} não tem itens`); return; }
     if (S.ledgerMonth !== target || ledItems().length) return;
     const max = daysIn(target);
-    const items = prev.map(i => ({...i, paid:false, ...(i.kind === "out" ? {spends:[]} : {}), date: i.date ? `${target}-${pad(Math.min(+i.date.slice(8,10) || 1, max))}` : ""}));
+    // copiedFrom marca os itens a revisar (some ao confirmar a revisão)
+    const items = prev.map(i => ({...i, paid:false, copiedFrom:pk, ...(i.kind === "out" ? {spends:[]} : {}), date: i.date ? `${target}-${pad(Math.min(+i.date.slice(8,10) || 1, max))}` : ""}));
     saveLedger(items);
     toast(`${items.length} itens repetidos de ${monthLabel(pk)}`);
+    // quem acabou de iniciar o período vai direto para a revisão
+    if (S.reviewAfterCopy === target){ S.reviewAfterCopy = null; S.tab = "led"; render(); sheetReview(); }
   } catch { if (!silent) toast("Não deu para ler o mês anterior."); }
 }
 function onErr(e){ console.warn(e); render(); }
@@ -866,7 +870,9 @@ function viewLedger(){
     </div>`;
   };
   const nothing = !items.length && !shared.length && !sharedInc.length;
-  return `${legacyBox}<div class="ledger-sum">
+  const toReview = items.filter(i => i.copiedFrom);
+  const reviewBox = toReview.length ? `<div class="banner" style="background:var(--accent-soft)"><span>${toReview.length} ${toReview.length===1?"item repetido":"itens repetidos"} de ${esc(monthLabel(toReview[0].copiedFrom))}. Confira os valores deste mês: só o que mudou.</span><button data-act="reviewLed">Revisar</button></div>` : "";
+  return `${reviewBox}${legacyBox}<div class="ledger-sum">
     <div class="ls hero"><div class="lbl">Sobra do período</div><div class="v num" style="color:${saldo<0?"var(--bad)":"var(--good)"}">${saldo<0?"−":"+"} ${money(Math.abs(saldo))}</div><div style="font-size:12px;color:var(--muted)">Rendas menos despesas (das compartilhadas, só a sua parte). Visível só para você.</div></div>
     <div class="ls"><div class="lbl">Renda</div><div class="v num" style="color:var(--good)">${money(R)}</div><div style="font-size:12px;color:var(--muted)">${RS ? `Compartilhadas ${money(RS)} · pessoais ${money(r2(R - RS))}` : `Recebido ${money(rec)}`}</div></div>
     <div class="ls"><div class="lbl">Despesas</div><div class="v num" style="color:var(--bad)">${money(D)}</div><div style="font-size:12px;color:var(--muted)">Compartilhadas ${money(DS)} · pessoais ${money(DP)}</div></div>
@@ -1049,6 +1055,71 @@ function sheetEnvelope(id){
     ? `<button class="btn" data-act="payEnv" data-id="${esc(id)}">Registrar pagamento</button>`
     : `<button class="btn" data-act="spendIn" data-id="${esc(id)}">Gastar</button><button class="btn ghost" data-act="transferFrom" data-id="${esc(id)}">Transferir</button><button class="btn ghost" data-act="extraIn" data-id="${esc(id)}">+ Valor</button>`}</div>
   ${mine.length ? `<div class="list">${mine.map(txLine).join("")}</div>` : `<p class="note">Nenhum movimento neste envelope ainda.</p>`}`, {type:"env"});
+}
+
+/* Pagamento único / renda já registrados: tocar no ✓ abre esta janela para desfazer (registro por engano)
+   ou, se ainda falta, registrar o restante. kind: "expense" (pagamento) ou "extra" (recebimento de renda). */
+function sheetUndoPay(envId, kind){
+  const e = envById(envId); if (!e) return;
+  const st = envStats()[envId], inc = kind === "extra";
+  const done = inc ? st.extra : st.spent, total = st.budget, falta = r2(total - done);
+  const list = sortTx(S.tx.filter(t => t.kind === kind && t.env === envId));
+  openSheet(`<h3>${esc(e.name)}</h3>
+  <p class="sub">${inc ? "Renda compartilhada" : "Pagamento único"} de ${money(total)} · ${inc ? "recebido" : "pago"} ${money(done)}${falta > 0.004 ? ` · falta ${money(falta)}` : ""}.</p>
+  <div class="list" style="margin-bottom:14px">${list.map(txLine).join("")}</div>
+  <div class="confirm" style="margin-bottom:12px"><p>Registrado por engano? Desfazer apaga ${list.length === 1 ? "este registro" : `os ${list.length} registros`} e a ${inc ? "renda volta para “a receber”" : "despesa volta para “a pagar”"}, também no acerto.</p>
+    <div class="btnrow"><button class="btn danger" type="button" data-act="doUndoPay">${inc ? "Desfazer recebimento" : "Desfazer pagamento"}</button>
+    ${falta > 0.004 ? `<button class="btn" type="button" data-act="${inc ? "recvRest" : "payRest"}" data-id="${esc(envId)}">${inc ? "Registrar o que falta" : "Pagar o que falta"}</button>` : ""}
+    <button class="btn ghost" type="button" data-act="close">Manter</button></div></div>
+  <p class="note">Para corrigir só valor, data ou quem ${inc ? "recebeu" : "pagou"}, toque no registro acima.</p>`, {type:"undo", env:envId, kind});
+}
+
+/* Revisão do mês: depois que o caixa é repetido do período anterior, uma lista só com nome e valor
+   para pequenos ajustes (valores que mudaram, itens que não se repetem). */
+function sheetReview(){
+  const items = ledItems();
+  if (!items.length){ toast("O caixa está vazio."); return; }
+  const rows = items.map(i => ({id:i.id, name:i.name, kind:i.kind, shared:i.shared, amount:i.amount, drop:false, used: i.shared && usedEnvIds().has(linkedEnvId(i.id))}));
+  const from = (items.find(i => i.copiedFrom) || {}).copiedFrom;
+  openSheet("", {type:"review", rows, from});
+  drawReview();
+}
+function drawReview(){
+  const c = sheetCtx;
+  const grp = [["Rendas", r => r.kind === "in"], ["Despesas compartilhadas", r => r.kind === "out" && r.shared], ["Despesas pessoais", r => r.kind === "out" && !r.shared]];
+  const tot = (f) => r2(c.rows.filter(r => !r.drop && f(r)).reduce((s,r) => s + (Number(r.amount) || 0), 0));
+  const R0 = tot(r => r.kind === "in"), D0 = tot(r => r.kind === "out");
+  $("#sheetHost .sheet").innerHTML = `<div class="grab"></div>
+  <h3>Revisar ${esc(monthLabel(S.ledgerMonth))}</h3>
+  <p class="sub">${c.from ? `Itens repetidos de ${esc(monthLabel(c.from))}. ` : ""}Ajuste só o que mudou; o resto fica igual. Valores das compartilhadas são o total (a divisão continua a mesma).</p>
+  ${grp.map(([t, f]) => { const rs = c.rows.map((r, i) => [r, i]).filter(([r]) => f(r)); if (!rs.length) return "";
+    return `<h4 style="margin:14px 2px 6px;font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">${t}</h4>
+    ${rs.map(([r, i]) => `<div class="rvrow ${r.drop ? "drop" : ""}">
+      <span class="t">${esc(r.name)}</span>
+      <input class="inp num" id="rv-${i}" data-rv="${i}" inputmode="decimal" value="${esc(moneyInput(r.amount))}" aria-label="Valor de ${esc(r.name)}" ${r.drop ? "disabled" : ""}>
+      ${r.used ? `<span class="s" title="Tem lançamentos neste período">fica</span>` : `<button class="btn ${r.drop ? "ghost" : "danger"}" type="button" data-act="rvKeep" data-i="${i}" style="padding:8px 10px;font-size:13px">${r.drop ? "Manter" : "Tirar"}</button>`}
+    </div>`).join("")}`; }).join("")}
+  <p class="note" style="margin:12px 4px">Rendas ${money(R0)} · despesas ${money(D0)} · sobra (antes da divisão) ${money(r2(R0 - D0))}</p>
+  <p class="err" id="rvErr" hidden></p>
+  <div class="btnrow"><button class="btn" type="button" data-act="rvSave">Confirmar ${esc(monthLabel(S.ledgerMonth))}</button><button class="btn ghost" type="button" data-act="close">Depois</button></div>`;
+}
+function readReview(){
+  document.querySelectorAll("[data-rv]").forEach(el => { const r = sheetCtx.rows[+el.dataset.rv]; if (r && !r.drop) r.amount = parseMoney(el.value); });
+}
+function saveReview(){
+  readReview();
+  const c = sheetCtx;
+  const bad = c.rows.find(r => !r.drop && !(r.amount > 0 && r.amount <= MAX_AMOUNT));
+  if (bad){ const e = $("#rvErr"); e.hidden = false; e.textContent = `Valor inválido em “${bad.name}”. Use números como 250 ou 1.250,50 (para tirar o item, toque em Tirar).`; return; }
+  const byId = new Map(c.rows.map(r => [r.id, r]));
+  const removeEnv = [], items = [];
+  for (const i of ledItems()){
+    const r = byId.get(i.id);
+    if (r && r.drop){ if (i.shared) removeEnv.push(linkedEnvId(i.id)); continue; }
+    const it = {...i, amount: r ? r2(r.amount) : i.amount}; delete it.copiedFrom;
+    items.push(it);
+  }
+  closeSheet(); saveLedger(items, removeEnv); toast(`${monthLabel(S.ledgerMonth)} confirmado`);
 }
 
 /* Renda compartilhada: registrar quem recebeu (vira um lançamento "extra" no registro da renda). */
@@ -1290,6 +1361,7 @@ function readSplit(){
 function saveLedger(items, removeEnv = []){
   if (!S.db || !S.uid || !S.ledgerMonth) return;
   const month = S.ledgerMonth;
+  items = items.map(i => { const o = {...i}; for (const k in o) if (o[k] === undefined) delete o[k]; return o; });
   S.ledger = {...(S.ledger||{}), items}; render();
   const batch = S.db.batch();
   batch.set(P.ledger(month), {month, items, updated:Date.now()});
@@ -1338,7 +1410,7 @@ async function startPeriod(k, start, moveLate){
     }
   }
   fire(batch.commit());
-  closeSheet(); S.tab = "env"; subMonth(k);
+  closeSheet(); S.tab = "led"; S.reviewAfterCopy = k; subMonth(k);
   toast(`${monthLabel(k)} iniciado em ${shortDate(start)}${moved ? ` · ${moved} lançamento(s) levados` : ""}`);
 }
 /* Envelopes pessoais antigos (de antes desta versão, visíveis ao grupo) → envelopes privados no Meu caixa,
@@ -1427,7 +1499,17 @@ document.addEventListener("click", async ev => {
       break; }
     case "spendIn": { const e = envAny(id); if (e && e.mode === "once") { const st = envStats()[id]; sheetExpense(null, id, st && st.left > 0 ? st.left : ""); } else sheetExpense(null, id); break; }
     case "payEnv": { const e = envById(id); if (!e) break; const st = envStats()[id];
-      if (st.avail > 0 && st.left <= 0.004) sheetEnvelope(id); else sheetExpense(null, id, st.left > 0 ? st.left : ""); break; }
+      if (st.spent > 0) sheetUndoPay(id, "expense"); else sheetExpense(null, id, st.left > 0 ? st.left : ""); break; }
+    case "payRest": { const st = envStats()[id]; sheetExpense(null, id, st && st.left > 0 ? st.left : ""); break; }
+    case "doUndoPay": {
+      const c = sheetCtx; if (!c || c.type !== "undo") break;
+      const ids = S.tx.filter(t => t.kind === c.kind && t.env === c.env).map(t => t.id);
+      closeSheet(); if (!ids.length) break;
+      const batch = S.db.batch(); ids.forEach(t => batch.delete(P.tx(S.viewMonth).doc(t)));
+      fire(batch.commit(), c.kind === "extra" ? "Recebimento desfeito" : "Pagamento desfeito"); break; }
+    case "reviewLed": sheetReview(); break;
+    case "rvKeep": { readReview(); const r = sheetCtx.rows[+el.dataset.i]; if (r){ r.drop = !r.drop; drawReview(); } break; }
+    case "rvSave": saveReview(); break;
     case "openPSpend": { const it = ledItems().find(i => i.id === id), sp = it && (it.spends || []).find(x => x.id === k); if (!sp) break;
       sheetExpense({kind:"expense", private:true, item:it.id, sid:sp.id, amount:sp.amount, desc:sp.desc, date:sp.date, ts:sp.ts, env:"p:" + it.id}); break; }
     case "goLed": S.tab = "led"; window.scrollTo(0,0); render(); break;
@@ -1443,7 +1525,8 @@ document.addEventListener("click", async ev => {
       ({expense:sheetExpense, transfer:sheetTransfer, extra:sheetExtra}[t.kind] || sheetExpense)(t); break; }
     case "recvEnv": { const e = envById(id); if (!e) break; const st = envStats()[id];
       const falta = r2(st.budget - st.extra);
-      if (st.budget > 0 && falta <= 0.004) sheetIncomeDetail(id); else sheetReceive(null, id, falta > 0 ? falta : ""); break; }
+      if (st.extra > 0) sheetUndoPay(id, "extra"); else sheetReceive(null, id, falta > 0 ? falta : ""); break; }
+    case "recvRest": { const st = envStats()[id]; const falta = st ? r2(st.budget - st.extra) : 0; sheetReceive(null, id, falta > 0 ? falta : ""); break; }
     case "openInc": sheetIncomeDetail(id); break;
     case "recvNew": { const st = envStats()[id]; sheetReceive(null, id, st && st.budget - st.extra > 0 ? r2(st.budget - st.extra) : ""); break; }
     case "askDel": $("#delBox").innerHTML = `<div class="confirm"><p>Apagar este lançamento? O valor volta para o envelope.</p><div class="btnrow"><button class="btn danger" type="button" data-act="doDel">Sim, apagar</button><button class="btn ghost" type="button" data-act="noDel">Manter</button></div></div>`; break;

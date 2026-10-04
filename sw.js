@@ -4,7 +4,7 @@
    - Rede primeiro, com limite de 4 s; se a rede falhar ou demorar, usa a cópia guardada.
    - Os DADOS offline ficam no cache do próprio Firestore (enablePersistence em app.js), não aqui.
    AO PUBLICAR UMA VERSÃO NOVA: aumente VERSION. */
-const VERSION = "orcamento-v12";
+const VERSION = "orcamento-v13";
 const FIREBASE = "https://www.gstatic.com/firebasejs/10.14.1/";
 const SHELL = ["./", "index.html", "app.js", "firebase-config.js", "manifest.webmanifest",
   "icon-192.png", "icon-512.png", "apple-touch-icon.png"];
