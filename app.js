@@ -50,7 +50,7 @@ function toast(msg){
 const S = {
   db:null, auth:null, uid:null, email:"", hid:null, live:false, noDb:false, authReady:false, profileLoaded:false, authErr:"",
   config:null, configLoaded:false, lastCurrent:null,
-  months:[], viewMonth:null, monthDoc:null, monthLoaded:false, tx:[],
+  months:[], viewMonth:null, monthDoc:null, monthLoaded:false, tx:[], hist:{},
   me:null,
   ledgerMonth:null, ledger:null, ledgerLoaded:false, ledgerTouched:false,
   tab: ls.get("tab") || "env", filter:"all",
@@ -170,6 +170,40 @@ function settlement(){
   return {people, perEnv, total, shares:sh, transfers};
 }
 
+/* Sugestões de descrição: a partir dos gastos já lançados (período na tela + até 4 períodos recentes).
+   Busca sem acento e sem maiúsculas, no começo da descrição ou de qualquer palavra ("ôni" → "Ônibus").
+   Ordem: usadas naquele envelope primeiro, depois as mais frequentes, depois as mais recentes. */
+const normTxt = s => String(s ?? "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
+function buildSuggestPool(list){
+  const map = new Map();
+  for (const t of list){
+    if (!t || t.kind !== "expense" || typeof t.desc !== "string") continue;
+    const d = t.desc.trim().slice(0, 80), key = normTxt(d);
+    if (!key) continue;
+    let g = map.get(key);
+    if (!g) map.set(key, g = {key, desc:d, n:0, last:"", amount:0, env:null, envN:{}});
+    g.n++;
+    if (typeof t.env === "string") g.envN[t.env] = (g.envN[t.env] || 0) + 1;
+    const when = String(t.date || "") + "|" + String(Number(t.ts) || 0).padStart(15, "0");
+    if (when >= g.last){ g.last = when; g.desc = d; g.amount = r2(t.amount); g.env = typeof t.env === "string" ? t.env : null; }
+  }
+  return [...map.values()];
+}
+function suggest(pool, q, envId, max = 6){
+  const nq = normTxt(q), out = [];
+  for (const g of pool){
+    const inEnv = (envId && g.envN[envId]) || 0;
+    let starts = false;
+    if (nq){
+      if (g.key === nq) continue;                                   // já está escrito
+      starts = g.key.startsWith(nq);
+      if (!starts && !g.key.split(/[\s\-\/.,()]+/).some(w => w.startsWith(nq))) continue;
+    } else if (envId && !inEnv) continue;                           // campo vazio: só as do envelope
+    out.push({...g, inEnv, score: inEnv * 3 + g.n + (starts ? 2 : 0)});
+  }
+  return out.sort((a,b) => b.score - a.score || b.last.localeCompare(a.last)).slice(0, max);
+}
+
 /* ---------- Firebase ---------- */
 const DEFAULT_TEMPLATE = [
   {name:"Alimentação", folder:"Casa", budget:250, type:"comum"},
@@ -225,7 +259,7 @@ function onErr(e){ console.warn(e); render(); }
 function attachHousehold(hid){
   if (S.hid === hid) return;
   unsubHH.forEach(u => u()); unsubHH = []; unsubMonth.forEach(u => u()); unsubMonth = [];
-  S.hid = hid; S.config = null; S.configLoaded = !hid; S.viewMonth = null; S.lastCurrent = null; S.months = []; S.monthDoc = null; S.tx = [];
+  S.hid = hid; S.config = null; S.configLoaded = !hid; S.viewMonth = null; S.lastCurrent = null; S.months = []; S.monthDoc = null; S.tx = []; S.hist = {}; histLoading.clear();
   if (!hid){ render(); return; }
   unsubHH.push(P.config().onSnapshot(s => {
     S.config = s.exists ? s.data() : null; S.configLoaded = true;
@@ -237,7 +271,27 @@ function attachHousehold(hid){
     S.lastCurrent = cur;
     render();
   }, e => { console.warn(e); S.configLoaded = true; S.config = null; render(); }));
-  unsubHH.push(P.months().onSnapshot(s => { S.months = s.docs.map(d => d.id).filter(isKey).sort(); render(); }, onErr));
+  unsubHH.push(P.months().onSnapshot(s => { S.months = s.docs.map(d => d.id).filter(isKey).sort(); loadHistory(); render(); }, onErr));
+}
+/* Gastos dos últimos períodos, lidos uma vez (get, não onSnapshot), só para as sugestões de descrição.
+   Offline, o Firestore responde com a cópia local. */
+const histLoading = new Set();
+function loadHistory(){
+  if (!S.db || !S.hid) return;
+  const hid = S.hid;
+  for (const k of S.months.slice(-4)){
+    if (S.hist[k] || histLoading.has(k)) continue;
+    histLoading.add(k);
+    P.tx(k).get().then(s => {
+      if (S.hid === hid) S.hist[k] = s.docs.map(d => d.data()).filter(t => t && t.kind === "expense").map(t => ({kind:t.kind, desc:t.desc, amount:t.amount, env:t.env, date:t.date, ts:t.ts}));
+    }).catch(() => {}).finally(() => histLoading.delete(k));
+  }
+}
+function suggestPool(){
+  const list = [];
+  for (const k in S.hist) if (k !== S.viewMonth) list.push(...S.hist[k]);
+  list.push(...S.tx);
+  return buildSuggestPool(list);
 }
 
 function boot(){
@@ -432,16 +486,26 @@ function viewEnvelopes(){
     const gl = r2(g.items.reduce((s,e) => s + st[e.id].left, 0));
     return `<section class="folder"><div class="folder-h"><h2>${esc(g.k)}</h2><span class="num">${money(gl)}</span></div><div class="card">${g.items.map(e => envRow(e, st[e.id], frac)).join("")}</div></section>`;
   }).join("") : `<div class="empty"><p>Nenhum envelope neste filtro.</p></div>`}
+  <p class="note" style="margin:-2px 4px 12px">Toque num envelope para lançar um gasto; ⋯ abre os detalhes. A barra mostra quanto resta e o traço, onde ela deveria estar pelo ritmo do período.</p>
   <div class="btnrow" style="margin-top:6px"><button class="btn ghost" data-act="transfer">Transferir entre envelopes</button><button class="btn ghost" data-act="extra">Acrescentar valor</button></div>`;
 }
+/* Linha compacta: toque na linha = lançar gasto; botão ⋯ = detalhes do envelope.
+   A barra mostra o que RESTA (cheia no início, esvazia com os gastos).
+   O traço do ritmo anda da direita para a esquerda: barra à esquerda do traço = gastando mais rápido que o período passa. */
+const leftFrac = s => s.avail > 0 ? Math.max(0, Math.min(1, s.left / s.avail)) : 0;
 function envRow(e, s, frac){
   const sk = status(s, frac);
-  const w = s.avail > 0 ? Math.min(100, s.spent / s.avail * 100) : (s.spent > 0 ? 100 : 0);
-  return `<button class="env" data-act="openEnv" data-id="${esc(e.id)}">
-    <div class="l1"><div style="min-width:0"><div class="name">${esc(e.name)}</div><div class="meta">${typeTag(e)}<span class="st ${sk.k}">${sk.t}</span></div></div>
-    <div><div class="amt num ${s.left<0?"neg":""}">${money(s.left)}</div><div class="of num">de ${money(s.avail)}</div></div></div>
-    <div class="bar ${sk.k}" aria-hidden="true"><i style="width:${w.toFixed(1)}%"></i>${frac>0&&frac<1?`<b style="left:calc(${(frac*100).toFixed(1)}% - 1px)"></b>`:""}</div>
-  </button>`;
+  const w = leftFrac(s) * 100;
+  const tick = frac > 0 && frac < 1 ? `<b style="left:calc(${((1 - frac) * 100).toFixed(1)}% - 1px)"></b>` : "";
+  const who = e.type === "comum" ? "" : `<span class="od" style="${pc(e.owner)}" title="Pessoal de ${esc(nameOf(e.owner))}">${esc(initials(e.owner))}</span>`;
+  return `<div class="env ${sk.k}">
+    <button class="env-go" data-act="spendIn" data-id="${esc(e.id)}" aria-label="Lançar gasto em ${esc(e.name)}. Resta ${esc(money(s.left))} de ${esc(money(s.avail))}. ${sk.t}.">
+      <span class="nm">${who}<span class="name">${esc(e.name)}</span></span>
+      <span class="amt num">${money(s.left)}</span>
+      <span class="bar ${sk.k}" aria-hidden="true"><i style="width:${w.toFixed(1)}%"></i>${tick}</span>
+    </button>
+    <button class="env-more" data-act="openEnv" data-id="${esc(e.id)}" aria-label="Detalhes de ${esc(e.name)}"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button>
+  </div>`;
 }
 
 function txLine(t){
@@ -571,7 +635,9 @@ let sheetCtx = null;
 function openSheet(html, ctx){
   sheetCtx = ctx || {};
   $("#sheetHost").innerHTML = `<div class="scrim" id="scrim"><div class="sheet" role="dialog" aria-modal="true"><div class="grab"></div>${html}</div></div>`;
-  const first = $("#sheetHost").querySelector("[autofocus]"); if (first) setTimeout(() => first.focus(), 60);
+  // foco na hora (ainda dentro do toque): é o que faz o iPhone abrir o teclado sozinho
+  const first = $("#sheetHost").querySelector("[autofocus]");
+  if (first){ try { first.focus({preventScroll:true}); } catch {} setTimeout(() => { if (document.activeElement !== first && $("#sheetHost").contains(first)) first.focus(); }, 60); }
 }
 function closeSheet(){ $("#sheetHost").innerHTML = ""; sheetCtx = null; }
 function envOptions(sel){
@@ -591,18 +657,32 @@ const auditLine = tx => tx && tx.createdBy ? `<p class="note" style="margin:0 0 
 const formButtons = (tx, label) => `${auditLine(tx)}<div class="btnrow"><button class="btn" type="submit">${tx ? "Salvar" : label}</button><button class="btn ghost" type="button" data-act="close">Cancelar</button>${tx ? `<button class="btn danger" type="button" data-act="askDel">Apagar</button>` : ""}</div><div id="delBox"></div>`;
 function dateBounds(k){ const s = periodStart(k), e = periodEnd(k); return `min="${esc(s)}"${e ? ` max="${esc(e)}"` : ""}`; }
 
+/* Gasto: aberto direto pelo toque no envelope (presetEnv). Ordem pensada para o mínimo de toques:
+   valor (teclado numérico já aberto) → descrição com sugestões → Lançar. Envelope, data e quem pagou já vêm preenchidos. */
 function sheetExpense(tx, presetEnv){
   const t = tx || {kind:"expense", amount:"", env: presetEnv || (envs()[0]||{}).id, desc:"", date: defaultDate(S.viewMonth), by: S.me};
-  openSheet(`<h3>${tx ? "Editar gasto" : "Novo gasto"}</h3><p class="sub">Sai do envelope escolhido e aparece nos outros celulares.</p>
+  const e0 = !tx && presetEnv ? envById(presetEnv) : null;
+  const s0 = e0 ? envStats()[e0.id] : null;
+  openSheet(`<h3>${tx ? "Editar gasto" : e0 ? esc(e0.name) : "Novo gasto"}</h3>
+  <p class="sub">${e0 ? `Resta <b class="num" style="color:${s0.left < 0 ? "var(--bad)" : "var(--ink)"}">${money(s0.left)}</b> de ${money(s0.avail)} neste envelope.` : "Sai do envelope escolhido e aparece nos outros celulares."}</p>
   <form id="fx" novalidate>
     <div class="field"><label for="fxAmt">Valor (R$)</label><input class="inp money num" id="fxAmt" inputmode="decimal" autocomplete="off" placeholder="0,00" value="${esc(moneyInput(t.amount))}" autofocus></div>
+    <div class="field"><label for="fxDesc">Descrição</label><input class="inp" id="fxDesc" placeholder="Ex.: feira, ração, Uber" value="${esc(t.desc)}" maxlength="80" autocomplete="off" autocapitalize="sentences">
+      <div class="sugs" id="fxSugs" role="group" aria-label="Sugestões de descrição" hidden></div></div>
     <div class="field"><label for="fxEnv">Envelope</label><select class="inp" id="fxEnv">${envOptions(t.env)}</select></div>
-    <div class="field"><label for="fxDesc">Descrição</label><input class="inp" id="fxDesc" placeholder="Ex.: feira, ração, Uber" value="${esc(t.desc)}" maxlength="80"></div>
     <div class="field"><label for="fxDate">Data <span style="font-weight:400">(${esc(monthLabel(S.viewMonth))}: ${esc(periodRange(S.viewMonth))})</span></label><input class="inp" type="date" id="fxDate" value="${esc(t.date)}" ${dateBounds(S.viewMonth)}></div>
     <div class="field"><label>Quem pagou</label>${whoPicker(t.by || S.me)}</div>
     <p class="err" id="fxErr" hidden></p>
     ${formButtons(tx, "Lançar gasto")}
-  </form>`, {type:"tx", id: tx && tx.id, kind:"expense"});
+  </form>`, {type:"tx", id: tx && tx.id, kind:"expense", fixedEnv: !!(tx || presetEnv), pool: suggestPool(), sugs: []});
+  drawSugs();
+}
+function drawSugs(){
+  const box = $("#fxSugs"), c = sheetCtx;
+  if (!box || !c || c.kind !== "expense") return;
+  c.sugs = suggest(c.pool || [], $("#fxDesc").value, $("#fxEnv").value);
+  box.innerHTML = c.sugs.map((g, i) => `<button type="button" class="sug" data-act="pickSug" data-i="${i}">${esc(g.desc)}<span class="num">${money(g.amount)}</span></button>`).join("");
+  box.hidden = !c.sugs.length;
 }
 function sheetTransfer(tx, presetFrom){
   const first = presetFrom || (envs()[0]||{}).id;
@@ -871,6 +951,17 @@ document.addEventListener("click", async ev => {
     case "pmKeep": $("#pmRemoveBox").innerHTML = ""; break;
     case "pmRemove": { const r = sheetCtx.rows[+el.dataset.i]; closeSheet(); if (await removeMember(r.id, false)) toast(`${r.name} removido(a). Ajuste a divisão em Pessoas e divisão.`); break; }
     case "openEnv": sheetEnvelope(id); break;
+    case "pickSug": {
+      const g = sheetCtx && sheetCtx.sugs && sheetCtx.sugs[+el.dataset.i]; if (!g) break;
+      $("#fxDesc").value = g.desc;
+      const amt = $("#fxAmt");
+      if (!amt.value.trim() && g.amount > 0) amt.value = moneyInput(g.amount);      // só preenche se estiver vazio
+      if (!sheetCtx.fixedEnv && g.env && envById(g.env)) $("#fxEnv").value = g.env;  // pelo botão "Gasto": vai para o envelope de costume
+      $("#fxErr").hidden = true;
+      drawSugs();
+      if (!(parseMoney(amt.value) > 0)) amt.focus();
+      else if (document.activeElement && document.activeElement.blur) document.activeElement.blur();   // fecha o teclado: falta só "Lançar gasto"
+      break; }
     case "spendIn": sheetExpense(null, id); break;
     case "transferFrom": sheetTransfer(null, id); break;
     case "extraIn": sheetExtra(null, id); break;
@@ -926,9 +1017,9 @@ document.addEventListener("click", async ev => {
       break; }
   }
 });
-document.addEventListener("change", ev => { if (ev.target.id === "mS") updateMoveHint(); });
+document.addEventListener("change", ev => { if (ev.target.id === "mS") updateMoveHint(); if (ev.target.id === "fxEnv") drawSugs(); });
 // ao corrigir qualquer campo, a mensagem de erro antiga do formulário some
-document.addEventListener("input", ev => { const f = ev.target.closest("form, .sheet"); const e = f && f.querySelector(".err"); if (e) e.hidden = true; });
+document.addEventListener("input", ev => { const f = ev.target.closest("form, .sheet"); const e = f && f.querySelector(".err"); if (e) e.hidden = true; if (ev.target.id === "fxDesc") drawSugs(); });
 
 $("#whoBtn").addEventListener("click", () => { S.tab = "set"; ls.set("tab","set"); render(); });
 $("#prevM").addEventListener("click", () => {
@@ -1034,7 +1125,7 @@ document.addEventListener("submit", async ev => {
   }
 });
 
-window.__orc = {S, envStats, settlement, parseMoney, status, periodFrac, periodStart, periodEnd, expectedEnd, defaultDate, shares, money, esc};
+window.__orc = {S, envStats, settlement, parseMoney, status, periodFrac, periodStart, periodEnd, expectedEnd, defaultDate, shares, money, esc, normTxt, buildSuggestPool, suggest, leftFrac};
 boot();
 if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost") && !window.FIREBASE_EMULATOR) {
   window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
