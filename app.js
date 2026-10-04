@@ -260,17 +260,19 @@ function attachHousehold(hid){
   if (S.hid === hid) return;
   unsubHH.forEach(u => u()); unsubHH = []; unsubMonth.forEach(u => u()); unsubMonth = [];
   S.hid = hid; S.config = null; S.configLoaded = !hid; S.viewMonth = null; S.lastCurrent = null; S.months = []; S.monthDoc = null; S.tx = []; S.hist = {}; histLoading.clear();
-  if (!hid){ render(); return; }
+  if (!hid){ S.myGroups = null; render(); return; }
   unsubHH.push(P.config().onSnapshot(s => {
     S.config = s.exists ? s.data() : null; S.configLoaded = true;
     resolveMe();
+    if (S.config && S.me) rememberGroup(S.hid, S.config.name);
+    else if (!s.metadata || !s.metadata.fromCache) forgetGroup(S.hid);
     const cur = S.config && isKey(S.config.currentMonth) ? S.config.currentMonth : null;
     const changed = cur !== S.lastCurrent;
     if (cur && (!S.viewMonth || (S.viewMonth === S.lastCurrent && changed))) subMonth(cur);
     if (cur && (!S.ledgerMonth || (!S.ledgerTouched && changed))) subLedger(cur);
     S.lastCurrent = cur;
     render();
-  }, e => { console.warn(e); S.configLoaded = true; S.config = null; render(); }));
+  }, e => { console.warn(e); S.configLoaded = true; S.config = null; forgetGroup(hid); render(); }));
   unsubHH.push(P.months().onSnapshot(s => { S.months = s.docs.map(d => d.id).filter(isKey).sort(); loadHistory(); render(); }, onErr));
 }
 /* Gastos dos últimos períodos, lidos uma vez (get, não onSnapshot), só para as sugestões de descrição.
@@ -294,6 +296,44 @@ function suggestPool(){
   return buildSuggestPool(list);
 }
 
+/* Seus grupos: aparecem na primeira tela quando a conta não está em nenhum grupo
+   (depois de sair do grupo, ou se o perfil perdeu o grupo atual). Duas fontes:
+   1) memória do aparelho (cada grupo aberto aqui é lembrado, por conta);
+   2) busca no servidor pelos grupos que têm a pessoa em memberUids (se as regras permitirem;
+      se recusarem, fica só a memória do aparelho). Tocar num grupo grava household no perfil. */
+const validHid = h => typeof h === "string" && /^[A-Za-z0-9]{10,40}$/.test(h);
+const gKey = () => "groups:" + S.uid;
+function knownGroups(){
+  try { const a = JSON.parse(ls.get(gKey()) || "[]");
+    return Array.isArray(a) ? a.filter(g => g && validHid(g.id)).map(g => ({id:g.id, name:String(g.name || "Grupo").slice(0, 30)})) : []; }
+  catch { return []; }
+}
+function rememberGroup(id, name){
+  if (!S.uid || !validHid(id)) return;
+  const a = knownGroups().filter(g => g.id !== id); a.unshift({id, name:String(name || "Grupo").slice(0, 30)});
+  ls.set(gKey(), JSON.stringify(a.slice(0, 10)));
+}
+function forgetGroup(id){ if (S.uid) ls.set(gKey(), JSON.stringify(knownGroups().filter(g => g.id !== id))); }
+function loadMyGroups(){
+  if (!S.db || !S.uid) return;
+  S.myGroups = knownGroups(); drawMyGroups();
+  const uid = S.uid;
+  S.db.collection("households").where("memberUids", "array-contains", uid).get().then(s => {
+    if (S.uid !== uid) return;
+    const found = s.docs.map(d => ({id:d.id, name:String((d.data() || {}).name || "Grupo").slice(0, 30)})).filter(g => validHid(g.id));
+    ls.set(gKey(), JSON.stringify(found.slice(0, 10)));          // o servidor é a fonte certa
+    S.myGroups = found; drawMyGroups();
+  }).catch(e => console.warn("Lista de grupos indisponível; usando a memória do aparelho.", e && e.code));
+}
+function myGroupsHtml(){
+  const g = S.myGroups || [];
+  if (!g.length) return "";
+  return `<h2 style="font-family:var(--f-display);font-size:22px;margin:0 0 6px">Seus grupos</h2>
+    <p style="color:var(--muted);margin:0 0 12px">Você faz parte ${g.length === 1 ? "deste grupo" : "destes grupos"}. Toque para abrir.</p>
+    <div class="list" style="box-shadow:none;border:1px solid var(--line)">${g.map(x => `<button class="li" data-act="openGroup" data-id="${esc(x.id)}"><div class="grow"><div class="t">${esc(x.name)}</div><div class="s">Código ${esc(x.id.slice(0, 6))}…</div></div><span class="chev">›</span></button>`).join("")}</div>`;
+}
+function drawMyGroups(){ const box = $("#myGroups"); if (!box) return; box.innerHTML = myGroupsHtml(); box.hidden = !(S.myGroups || []).length; }
+
 function boot(){
   render();
   const cfg = window.FIREBASE_CONFIG;
@@ -309,9 +349,12 @@ function boot(){
   S.auth.onAuthStateChanged(u => {
     S.authReady = true;
     if (unsubProfile){ unsubProfile(); unsubProfile = null; }
-    S.uid = u ? u.uid : null; S.email = u ? (u.email || "") : "";
+    S.uid = u ? u.uid : null; S.email = u ? (u.email || "") : ""; S.myGroups = null;
     if (!u){ attachHousehold(null); S.profileLoaded = false; if (unsubLedger){ unsubLedger(); unsubLedger = null; } S.ledger = null; S.ledgerMonth = null; render(); return; }
-    unsubProfile = P.profile().onSnapshot(s => {
+    unsubProfile = P.profile().onSnapshot({includeMetadataChanges:true}, s => {
+      // Logo depois do login, a cópia local pode ainda não ter o perfil: "não existe" vindo do cache
+      // não quer dizer "sem grupo". Com internet, espera a resposta do servidor antes de decidir.
+      if (!s.exists && s.metadata && s.metadata.fromCache && navigator.onLine) return;
       S.profileLoaded = true;
       const h = s.exists ? s.data().household : null;
       attachHousehold(typeof h === "string" && /^[A-Za-z0-9]{10,40}$/.test(h) ? h : null);
@@ -394,7 +437,7 @@ function render(){
   if (!S.authReady) return show("load", `<div class="empty"><h3>Abrindo…</h3></div>`);
   if (!S.uid) return show("login", viewLogin());
   if (!S.profileLoaded) return show("load", `<div class="empty"><h3>Abrindo seu orçamento…</h3></div>`);
-  if (!S.hid) return show("hh", viewHousehold());
+  if (!S.hid){ if (!S.myGroups){ S.myGroups = knownGroups(); setTimeout(loadMyGroups, 0); } return show("hh", viewHousehold()); }
   if (!S.configLoaded) return show("load", `<div class="empty"><h3>Abrindo seu orçamento…</h3></div>`);
   if (!S.config || !S.me) return show("nohh", `<div class="empty"><h3>Grupo não encontrado</h3><p>O código pode estar errado, ou você foi removido do grupo.</p><button class="btn" data-act="leaveHH">Entrar em outro grupo</button></div>`);
   const fn = {env:viewEnvelopes, tx:viewTx, bal:viewBalance, led:viewLedger, set:viewSettings}[S.tab] || viewEnvelopes;
@@ -428,8 +471,9 @@ function viewLogin(){
   </section>`;
 }
 function viewHousehold(){
-  return `<section class="summary" style="margin-top:8px">
-    <h2 style="font-family:var(--f-display);font-size:22px;margin:0 0 6px">Criar um grupo</h2>
+  return `<section class="summary" id="myGroups" style="margin-top:8px" ${(S.myGroups || []).length ? "" : "hidden"}>${myGroupsHtml()}</section>
+  <section class="summary" style="margin-top:8px">
+    <h2 style="font-family:var(--f-display);font-size:22px;margin:0 0 6px">Criar um grupo novo</h2>
     <p style="color:var(--muted);margin:0 0 14px">Quem cria vira o administrador e recebe um código para as outras pessoas entrarem. Os envelopes começam com o seu modelo do Goodbudget e tudo pode ser editado depois.</p>
     <form id="fHH">
       <div class="two"><div class="field"><label for="hhN">Nome do grupo</label><input class="inp" id="hhN" value="Casa" maxlength="30" required></div>
@@ -470,7 +514,12 @@ function viewEnvelopes(){
   const fl = (key, txt) => `<button class="chip" data-act="filter" data-k="${esc(key)}" aria-pressed="${f===key}">${esc(txt)}</button>`;
   const owners = activeMembers().filter(m => envs().some(e => e.type !== "comum" && e.owner === m.id));
   return pastBanner() + `
-  <section class="summary">
+  <div class="chips" role="group" aria-label="Filtro">${fl("all","Todos")}${fl("comum","Em comum")}${owners.map(m => fl(m.id, m.name)).join("")}</div>
+  ${folders.length ? folders.map(g => {
+    const gl = r2(g.items.reduce((s,e) => s + st[e.id].left, 0));
+    return `<section class="folder"><div class="folder-h"><h2>${esc(g.k)}</h2><span class="num">${plain(gl)}</span></div><div class="card">${g.items.map(e => envRow(e, st[e.id], frac)).join("")}</div></section>`;
+  }).join("") : `<div class="empty"><p>Nenhum envelope neste filtro.</p></div>`}
+  <section class="summary" style="margin-top:4px">
     <div class="row1">
       <div><div class="lbl">Disponível agora</div><div class="big num ${tLeft<0?"neg":""}">${money(tLeft)}</div></div>
       <div class="paceline">${pace}</div>
@@ -481,11 +530,6 @@ function viewEnvelopes(){
       <div><div class="lbl">Usado</div><div class="v num">${tAvail>0?Math.round(tSpent/tAvail*100):0}%</div></div>
     </div>
   </section>
-  <div class="chips" role="group" aria-label="Filtro">${fl("all","Todos")}${fl("comum","Em comum")}${owners.map(m => fl(m.id, m.name)).join("")}</div>
-  ${folders.length ? folders.map(g => {
-    const gl = r2(g.items.reduce((s,e) => s + st[e.id].left, 0));
-    return `<section class="folder"><div class="folder-h"><h2>${esc(g.k)}</h2><span class="num">${money(gl)}</span></div><div class="card">${g.items.map(e => envRow(e, st[e.id], frac)).join("")}</div></section>`;
-  }).join("") : `<div class="empty"><p>Nenhum envelope neste filtro.</p></div>`}
   <p class="note" style="margin:-2px 4px 12px">Toque num envelope para lançar um gasto; ⋯ abre os detalhes. A barra mostra quanto resta e o traço, onde ela deveria estar pelo ritmo do período.</p>
   <div class="btnrow" style="margin-top:6px"><button class="btn ghost" data-act="transfer">Transferir entre envelopes</button><button class="btn ghost" data-act="extra">Acrescentar valor</button></div>`;
 }
@@ -942,6 +986,7 @@ document.addEventListener("click", async ev => {
     case "copyCode": try { await navigator.clipboard.writeText(S.hid); toast("Código copiado"); } catch { const r = document.createRange(); r.selectNodeContents($("#hhCode")); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); toast("Código selecionado: copie"); } break;
     case "toggleJoin": fire(P.config().update({joinOpen: S.config.joinOpen === false}), S.config.joinOpen === false ? "Convites abertos" : "Convites fechados"); break;
     case "leaveHH": fire(P.profile().set({household:null}, {merge:true})); break;
+    case "openGroup": if (validHid(id)) { S.myGroups = null; fire(P.profile().set({household:id}, {merge:true})); } break;
     case "askLeave":
       if (isOwner() && activeMembers().length > 1){ $("#leaveBox").innerHTML = `<div class="confirm" style="margin-top:12px"><p>Você é o administrador. Remova as outras pessoas antes de sair, ou peça para elas criarem outro grupo.</p></div>`; break; }
       $("#leaveBox").innerHTML = `<div class="confirm" style="margin-top:12px"><p>Sair do grupo ${esc(S.config.name || "")}? Você deixa de ver os envelopes. Para voltar, precisa do código de novo.</p><div class="btnrow"><button class="btn danger" data-act="doLeave">Sair do grupo</button><button class="btn ghost" data-act="noLeave">Ficar</button></div></div>`; break;
@@ -1130,7 +1175,7 @@ document.addEventListener("submit", async ev => {
   }
 });
 
-window.__orc = {S, envStats, settlement, parseMoney, status, periodFrac, periodStart, periodEnd, expectedEnd, defaultDate, shares, money, esc, normTxt, buildSuggestPool, suggest, leftFrac};
+window.__orc = {S, envStats, settlement, parseMoney, status, periodFrac, periodStart, periodEnd, expectedEnd, defaultDate, shares, money, esc, normTxt, buildSuggestPool, suggest, leftFrac, overFrac};
 boot();
 if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost") && !window.FIREBASE_EMULATOR) {
   window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
