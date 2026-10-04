@@ -1,0 +1,10 @@
+# Cabeçalhos de segurança para o Netlify (Opção A do LEIA-ME)
+/*
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+  Cross-Origin-Opener-Policy: same-origin-allow-popups
+/sw.js
+  Cache-Control: no-cache
