@@ -52,8 +52,8 @@ const S = {
   config:null, configLoaded:false, lastCurrent:null,
   months:[], viewMonth:null, monthDoc:null, monthLoaded:false, tx:[], hist:{},
   me:null,
-  ledgerMonth:null, ledger:null, ledgerLoaded:false, ledgerTouched:false,
-  tab: ls.get("tab") || "env", filter:"all",
+  ledgerMonth:null, ledger:null, ledgerLoaded:false, ledgerAuto:{},
+  tab: "env", filter:"all",          // o app sempre abre em Envelopes
 };
 let unsubMonth = [], unsubLedger = null, unsubHH = [];
 
@@ -82,10 +82,61 @@ function shares(){
 }
 const shareLabel = v => (Math.round((Number(v) || 0) * 10) / 10).toString().replace(".", ",") + "%";
 /* Dados vindos do banco são tratados como não confiáveis: itens malformados são ignorados em vez de quebrar a tela. */
-const cleanEnv = e => e && typeof e === "object" && typeof e.id === "string" && e.id ? {...e, name:String(e.name || "Sem nome").slice(0,60), folder:String(e.folder || "Geral").slice(0,40), budget: isFinite(Number(e.budget)) ? Number(e.budget) : 0} : null;
+/* Divisão própria de uma despesa compartilhada: {uid: porcentagem}, soma 100. Inválida → null (usa a do grupo). */
+function cleanSplit(sp){
+  if (!sp || typeof sp !== "object" || Array.isArray(sp)) return null;
+  const out = {}; let sum = 0;
+  for (const [id, v] of Object.entries(sp)){ const n = Number(v); if (typeof id !== "string" || !id || !isFinite(n) || n < 0 || n > 100) return null; if (n > 0){ out[id] = n; sum += n; } }
+  return Object.keys(out).length && Math.abs(sum - 100) <= 0.05 ? out : null;
+}
+const cleanSrc = s => s && typeof s === "object" && typeof s.uid === "string" && typeof s.item === "string" ? {uid:s.uid, item:s.item} : null;
+const cleanEnv = e => {
+  if (!e || typeof e !== "object" || typeof e.id !== "string" || !e.id) return null;
+  const out = {...e, name:String(e.name || "Sem nome").slice(0,60), folder:String(e.folder || "Geral").slice(0,40), budget: isFinite(Number(e.budget)) ? Number(e.budget) : 0,
+    mode: e.mode === "once" ? "once" : "track"};
+  const sp = cleanSplit(e.split), src = cleanSrc(e.src);
+  if (sp) out.split = sp; else delete out.split;
+  if (src) out.src = src; else delete out.src;
+  return out;
+};
 const envs = () => (S.monthDoc && Array.isArray(S.monthDoc.envelopes)) ? S.monthDoc.envelopes.map(cleanEnv).filter(Boolean) : [];
 const envById = id => envs().find(e => e.id === id);
 const typeTag = e => e.type === "comum" ? `<span class="tag c">Em comum</span>` : `<span class="tag p" style="${pc(e.owner)}">${esc(nameOf(e.owner))}</span>`;
+/* Divisão efetiva de um envelope em comum: a própria (definida no Meu caixa de quem criou) ou a padrão do grupo. */
+const envSplit = e => (e && e.split) || shares();
+const splitLabel = sp => Object.entries(sp).filter(([, v]) => v > 0).sort((a,b) => memberIndex(a[0]) - memberIndex(b[0])).map(([id, v]) => `${nameOf(id)} ${shareLabel(v)}`).join(" · ");
+
+/* ---------- Meu caixa ↔ envelopes ----------
+   Cada despesa do Meu caixa tem:
+   - shared: compartilhada com o grupo (vira envelope "Em comum", visível a todos, com divisão própria) ou
+     pessoal (fica privada: só a dona vê, nem o administrador);
+   - mode: "once" (pagamento único: paga-se de uma vez, marcando quem pagou) ou "track" (envelope
+     acompanhado ao longo do período). Pessoal + track = envelope privado, que só a dona vê na aba Envelopes;
+     os gastos dele ficam guardados no próprio caixa (item.spends).
+   O envelope de uma despesa compartilhada tem id "cx" + id do item e guarda src = {uid, item}. */
+const linkedEnvId = itemId => "cx" + itemId;
+function cleanItem(i){
+  if (!i || typeof i !== "object" || typeof i.id !== "string") return null;
+  const out = {...i, kind: i.kind === "in" ? "in" : "out", name:String(i.name || "Sem nome").slice(0,60), amount: isFinite(Number(i.amount)) ? r2(i.amount) : 0, date: isISO(i.date) ? i.date : "", paid: !!i.paid};
+  if (out.kind === "in"){ delete out.shared; delete out.mode; delete out.split; delete out.spends; return out; }
+  out.shared = !!i.shared; out.mode = i.mode === "track" ? "track" : "once";
+  out.split = cleanSplit(i.split); if (!out.split) delete out.split;
+  out.folder = String(i.folder || "").slice(0, 40);
+  out.spends = Array.isArray(i.spends) ? i.spends.filter(s => s && typeof s.id === "string" && isFinite(Number(s.amount))).map(s => ({id:s.id, amount:r2(s.amount), desc:String(s.desc || "").slice(0,80), date: isISO(s.date) ? s.date : "", ts: Number(s.ts) || 0})) : [];
+  return out;
+}
+function ledItems(){ return (S.ledger && Array.isArray(S.ledger.items)) ? S.ledger.items.map(cleanItem).filter(Boolean) : []; }
+/* Envelopes privados (pessoal + acompanhar): aparecem só para a dona, com id "p:" + id do item. */
+const isPriv = id => typeof id === "string" && id.startsWith("p:");
+function privEnvs(){ return ledItems().filter(i => i.kind === "out" && !i.shared && i.mode === "track").map(i => ({id:"p:" + i.id, item:i.id, name:i.name, folder:"Só você vê", budget:i.amount, type:"privado", private:true})); }
+const privItem = id => isPriv(id) ? ledItems().find(i => i.id === id.slice(2)) : null;
+function privStats(i){ const spent = r2(i.spends.reduce((s,x) => s + x.amount, 0)), budget = r2(i.amount); return {budget, extra:0, tin:0, tout:0, spent, avail:budget, left:r2(budget - spent)}; }
+const envAny = id => isPriv(id) ? privEnvs().find(e => e.id === id) : envById(id);
+/* Envelope em comum que corresponde a um item do caixa (como ficará gravado no período). */
+function envFromItem(i){
+  return {id: linkedEnvId(i.id), name:i.name.slice(0,60), folder:(i.folder || "Compartilhadas").slice(0,40), budget:r2(i.amount), type:"comum", owner:null,
+    mode:i.mode, ...(i.split ? {split:{...i.split}} : {}), src:{uid:S.uid, item:i.id}};
+}
 
 /* ---------- períodos ----------
    Um período começa quando alguém toca em "Iniciar novo período" e escolhe a data de início
@@ -132,28 +183,41 @@ function status(st, frac){
   if (used > frac + 0.15 && used > 0.3) return {k:"warn", t:"Acima do ritmo"};
   return {k:"good", t:"Com folga"};
 }
-/* Acerto para N pessoas: em centavos; quem pagou mais que a sua parte recebe; transferências mínimas (guloso). */
+/* Divide `cents` centavos pela divisão `sp` ({id: %}); o centavo que sobra vai para as maiores porcentagens. */
+function splitCents(cents, sp){
+  const out = {}, ids = Object.keys(sp).filter(id => sp[id] > 0);
+  let given = 0;
+  for (const id of ids){ out[id] = Math.floor(cents * sp[id] / 100); given += out[id]; }
+  const ranked = [...ids].sort((a,b) => (sp[b] - sp[a]) || a.localeCompare(b));
+  for (let i = 0; given < cents && ranked.length; i++, given++) out[ranked[i % ranked.length]]++;
+  return out;
+}
+/* Acerto para N pessoas: em centavos; cada envelope em comum é dividido pela sua própria divisão
+   (definida no Meu caixa) ou pela divisão padrão do grupo; quem pagou mais que a sua parte recebe;
+   transferências mínimas (guloso). */
 function settlement(){
   const sh = shares();
   const people = {};
   const touch = id => people[id] ||= {comum:0, pessoal:0};
   for (const id in sh) touch(id);
-  const perEnv = {};
+  const perEnv = {}, envCents = {};
   for (const t of S.tx){
     if (t.kind !== "expense") continue;
     const e = envById(t.env); if (!e) continue;
     const a = r2(t.amount), w = t.by || "?";
     touch(w);
-    if (e.type === "comum"){ people[w].comum = r2(people[w].comum + a); (perEnv[e.id] ||= {})[w] = r2(((perEnv[e.id] || {})[w] || 0) + a); }
+    if (e.type === "comum"){ people[w].comum = r2(people[w].comum + a); (perEnv[e.id] ||= {})[w] = r2(((perEnv[e.id] || {})[w] || 0) + a); envCents[e.id] = (envCents[e.id] || 0) + Math.round(a * 100); }
     else people[w].pessoal = r2(people[w].pessoal + a);
   }
   const total = r2(Object.values(people).reduce((s,p) => s + p.comum, 0));
+  const part = {};
+  for (const eid in envCents){
+    const sp = envSplit(envById(eid));
+    const pc2 = splitCents(envCents[eid], Object.keys(sp).length ? sp : sh);
+    for (const id in pc2){ touch(id); part[id] = (part[id] || 0) + pc2[id]; }
+  }
   const ids = Object.keys(people);
-  const cents = Math.round(total * 100);
-  const part = {}; let given = 0;
-  for (const id of ids){ part[id] = Math.floor(cents * (sh[id] || 0) / 100); given += part[id]; }
-  const ranked = ids.filter(id => sh[id] > 0).sort((a,b) => (sh[b] - sh[a]) || a.localeCompare(b));
-  for (let i = 0; given < cents && ranked.length; i++, given++) part[ranked[i % ranked.length]]++;
+  for (const id of ids) part[id] ||= 0;
   const net = {};
   for (const id of ids){ people[id].share = part[id] / 100; net[id] = Math.round(people[id].comum * 100) - part[id]; }
   const cred = ids.filter(id => net[id] > 0).map(id => ({id, v:net[id]})).sort((a,b) => b.v - a.v || a.id.localeCompare(b.id));
@@ -205,18 +269,6 @@ function suggest(pool, q, envId, max = 6){
 }
 
 /* ---------- Firebase ---------- */
-const DEFAULT_TEMPLATE = [
-  {name:"Alimentação", folder:"Casa", budget:250, type:"comum"},
-  {name:"Outros (casa)", folder:"Casa", budget:350, type:"comum"},
-  {name:"Gatos", folder:"Casa", budget:571.5, type:"comum"},
-  {name:"Contas", folder:"Casa", budget:0, type:"comum"},
-  {name:"Psicanálise", folder:"Saúde", budget:1000, type:"pessoal"},
-  {name:"Farmácia", folder:"Saúde", budget:350, type:"pessoal"},
-  {name:"English", folder:"Educação e lazer", budget:600, type:"pessoal"},
-  {name:"Livros", folder:"Educação e lazer", budget:150, type:"pessoal"},
-  {name:"Transporte público", folder:"Mobilidade", budget:250, type:"pessoal"},
-  {name:"Outros", folder:"Outros", budget:800, type:"pessoal"},
-];
 const P = {
   config: () => S.db.doc("households/" + S.hid),
   month: k => S.db.doc("households/" + S.hid + "/months/" + k),
@@ -245,14 +297,41 @@ function subMonth(k){
   if (!S.db || !S.hid || !S.viewMonth) { render(); return; }
   unsubMonth.push(P.month(k).onSnapshot(s => { S.monthDoc = s.exists ? s.data() : null; S.monthLoaded = true; render(); }, onErr));
   unsubMonth.push(P.tx(k).onSnapshot(s => { S.tx = s.docs.map(d => ({...d.data(), id:d.id})).filter(t => t && typeof t.kind === "string"); render(); }, onErr));
+  subLedger(S.viewMonth);
   render();
 }
+/* O Meu caixa acompanha o período que está na tela (mesmo mês das abas Envelopes e Acerto). */
 function subLedger(k){
-  if (unsubLedger) unsubLedger();
-  S.ledgerMonth = isKey(k) ? k : todayKey(); S.ledger = null; S.ledgerLoaded = false;
-  if (!S.db || !S.uid) { render(); return; }
-  unsubLedger = P.ledger(S.ledgerMonth).onSnapshot(s => { S.ledger = s.exists ? s.data() : null; S.ledgerLoaded = true; render(); }, onErr);
+  if (unsubLedger){ unsubLedger(); unsubLedger = null; }
+  S.ledgerMonth = isKey(k) ? k : null; S.ledger = null; S.ledgerLoaded = false;
+  if (!S.db || !S.uid || !S.ledgerMonth) { render(); return; }
+  const lk = S.ledgerMonth;
+  unsubLedger = P.ledger(lk).onSnapshot(s => {
+    S.ledger = s.exists ? s.data() : null; S.ledgerLoaded = true;
+    // Repetir de um mês para o outro: o caixa do período ativo, ainda inexistente no servidor,
+    // nasce como cópia do período anterior (uma vez por sessão; offline fica o botão "Copiar").
+    if (!s.exists && !(s.metadata && s.metadata.fromCache) && S.config && lk === S.config.currentMonth && !S.ledgerAuto[lk]){
+      S.ledgerAuto[lk] = true; copyLedgerFromPrev(lk, true);
+    }
+    render();
+  }, onErr);
   render();
+}
+const prevPeriodKey = k => S.months.filter(x => x < k).pop() || addMonth(k, -1);
+/* Copia os itens do caixa do período anterior: mantém os ids (o vínculo com os envelopes compartilhados
+   continua), zera "pago" e os gastos dos envelopes privados, ajusta o dia ao tamanho do mês. */
+async function copyLedgerFromPrev(target, silent){
+  const pk = prevPeriodKey(target);
+  try {
+    const s = await P.ledger(pk).get();
+    const prev = s.exists && Array.isArray(s.data().items) ? s.data().items.map(cleanItem).filter(Boolean) : [];
+    if (!prev.length){ if (!silent) toast(`${monthLabel(pk)} não tem itens`); return; }
+    if (S.ledgerMonth !== target || ledItems().length) return;
+    const max = daysIn(target);
+    const items = prev.map(i => ({...i, paid:false, ...(i.kind === "out" ? {spends:[]} : {}), date: i.date ? `${target}-${pad(Math.min(+i.date.slice(8,10) || 1, max))}` : ""}));
+    saveLedger(items);
+    toast(`${items.length} itens repetidos de ${monthLabel(pk)}`);
+  } catch { if (!silent) toast("Não deu para ler o mês anterior."); }
 }
 function onErr(e){ console.warn(e); render(); }
 
@@ -260,7 +339,7 @@ function attachHousehold(hid){
   if (S.hid === hid) return;
   unsubHH.forEach(u => u()); unsubHH = []; unsubMonth.forEach(u => u()); unsubMonth = [];
   S.hid = hid; S.config = null; S.configLoaded = !hid; S.viewMonth = null; S.lastCurrent = null; S.months = []; S.monthDoc = null; S.tx = []; S.hist = {}; histLoading.clear();
-  if (!hid){ S.myGroups = null; render(); return; }
+  if (!hid){ S.myGroups = null; subLedger(null); render(); return; }
   unsubHH.push(P.config().onSnapshot(s => {
     S.config = s.exists ? s.data() : null; S.configLoaded = true;
     resolveMe();
@@ -269,7 +348,6 @@ function attachHousehold(hid){
     const cur = S.config && isKey(S.config.currentMonth) ? S.config.currentMonth : null;
     const changed = cur !== S.lastCurrent;
     if (cur && (!S.viewMonth || (S.viewMonth === S.lastCurrent && changed))) subMonth(cur);
-    if (cur && (!S.ledgerMonth || (!S.ledgerTouched && changed))) subLedger(cur);
     S.lastCurrent = cur;
     render();
   }, e => { console.warn(e); S.configLoaded = true; S.config = null; forgetGroup(hid); render(); }));
@@ -293,6 +371,7 @@ function suggestPool(){
   const list = [];
   for (const k in S.hist) if (k !== S.viewMonth) list.push(...S.hist[k]);
   list.push(...S.tx);
+  for (const i of ledItems()) for (const s of (i.spends || [])) list.push({kind:"expense", desc:s.desc, amount:s.amount, env:"p:" + i.id, date:s.date, ts:s.ts});
   return buildSuggestPool(list);
 }
 
@@ -383,7 +462,8 @@ function authMsg(e){
 }
 async function createHousehold(groupName, myName){
   const ref = S.db.collection("households").doc();
-  const template = DEFAULT_TEMPLATE.map(e => ({id:rid(), name:e.name, folder:e.folder, budget:e.budget, type:e.type, owner:e.type === "comum" ? null : S.uid}));
+  // Sem modelo de envelopes: os envelopes do grupo nascem das despesas compartilhadas do Meu caixa.
+  const template = [];
   const k = todayKey(), start = todayISO();
   const batch = S.db.batch();
   batch.set(ref, {name:groupName, ownerUid:S.uid, joinOpen:true, memberUids:[S.uid], members:{[S.uid]:{name:myName, order:Date.now()}}, template, currentMonth:k, periods:{[k]:start}, created:Date.now()});
@@ -413,19 +493,18 @@ function render(){
   else wb.hidden = true;
   document.querySelectorAll("#nav button").forEach(b => b.setAttribute("aria-current", b.dataset.tab === S.tab ? "page" : "false"));
 
-  const isLed = S.tab === "led";
-  const mk = isLed ? S.ledgerMonth : S.viewMonth;
+  const mk = S.viewMonth;
   const ready = !!(S.config && S.me);
   $("#title").textContent = !ready ? "Orçamento colaborativo" : (S.tab === "set") ? "Ajustes" : (mk ? monthLabel(mk) : "Orçamento");
   const showNav = ready && S.tab !== "set" && !!mk;
   $("#prevM").hidden = $("#nextM").hidden = !showNav;
-  if (!isLed && showNav){
+  if (showNav){
     const i = S.months.indexOf(S.viewMonth);
     $("#prevM").disabled = i <= 0; $("#nextM").disabled = i < 0 || i >= S.months.length - 1;
   } else { $("#prevM").disabled = false; $("#nextM").disabled = false; }
 
   const fab = $("#fab");
-  fab.hidden = !ready || !((S.monthDoc && envs().length && (S.tab === "env" || S.tab === "tx")) || (S.tab === "led" && S.uid));
+  fab.hidden = !ready || !(((envs().length || privEnvs().length) && (S.tab === "env" || S.tab === "tx")) || (S.tab === "led" && S.uid && S.ledgerMonth));
   fab.querySelector("span").textContent = S.tab === "led" ? "Item" : "Gasto";
 
   const m = $("#main");
@@ -474,7 +553,7 @@ function viewHousehold(){
   return `<section class="summary" id="myGroups" style="margin-top:8px" ${(S.myGroups || []).length ? "" : "hidden"}>${myGroupsHtml()}</section>
   <section class="summary" style="margin-top:8px">
     <h2 style="font-family:var(--f-display);font-size:22px;margin:0 0 6px">Criar um grupo novo</h2>
-    <p style="color:var(--muted);margin:0 0 14px">Quem cria vira o administrador e recebe um código para as outras pessoas entrarem. Os envelopes começam com o seu modelo do Goodbudget e tudo pode ser editado depois.</p>
+    <p style="color:var(--muted);margin:0 0 14px">Quem cria vira o administrador e recebe um código para as outras pessoas entrarem. Depois, cada pessoa cadastra rendas e despesas no Meu caixa: as compartilhadas viram os envelopes do grupo.</p>
     <form id="fHH">
       <div class="two"><div class="field"><label for="hhN">Nome do grupo</label><input class="inp" id="hhN" value="Casa" maxlength="30" required></div>
       <div class="field"><label for="hhA">Seu nome</label><input class="inp" id="hhA" value="Antoine" maxlength="24" required></div></div>
@@ -494,14 +573,23 @@ function viewHousehold(){
   <p class="note">Conectado como ${esc(S.email)}. <button class="btn ghost" style="padding:4px 10px;font-size:13px" data-act="signOut">Sair</button></p>`;
 }
 
+/* Estatísticas de todos os envelopes que esta pessoa vê: os do grupo + os privados dela. */
+function allStats(){
+  const st = envStats();
+  for (const i of ledItems()) if (i.kind === "out" && !i.shared && i.mode === "track") st["p:" + i.id] = privStats(i);
+  return st;
+}
 function viewEnvelopes(){
   if (!S.monthLoaded) return `<div class="empty"><h3>Carregando ${esc(monthLabel(S.viewMonth))}…</h3><p>Os envelopes aparecem em instantes.</p></div>`;
-  if (!S.monthDoc || !envs().length) return pastBanner() + `<div class="empty"><h3>Nenhum envelope em ${esc(monthLabel(S.viewMonth))}</h3><p>Monte os envelopes deste período a partir do modelo padrão.</p><button class="btn" data-act="editMonthFromTemplate">Montar a partir do modelo</button></div>`;
-  const st = envStats(), k = S.viewMonth, frac = periodFrac(k);
-  const f = S.filter;
-  const list = envs().filter(e => f === "all" ? true : f === "comum" ? e.type === "comum" : (e.type !== "comum" && e.owner === f));
+  const group = envs(), priv = privEnvs();
+  if (!group.length && !priv.length) return pastBanner() + `<div class="empty"><h3>Nenhum envelope em ${esc(monthLabel(S.viewMonth))}</h3><p>Os envelopes nascem do Meu caixa: cadastre lá as despesas do mês. As compartilhadas aparecem aqui para todo o grupo; as pessoais com acompanhamento, só para você.</p><button class="btn" data-act="goLed">Abrir Meu caixa</button></div>`;
+  const st = allStats(), k = S.viewMonth, frac = periodFrac(k);
+  const f = S.filter === "comum" || S.filter === "mine" ? S.filter : "all";
+  const keep = e => f === "all" ? true : f === "comum" ? e.type === "comum" : (e.private || (e.type === "pessoal" && e.owner === S.me));
+  const tracked = [...group.filter(e => e.mode !== "once"), ...priv].filter(keep);
+  const once = group.filter(e => e.mode === "once").filter(keep);
   let tAvail = 0, tSpent = 0;
-  for (const e of list){ tAvail += st[e.id].avail; tSpent += st[e.id].spent; }
+  for (const e of [...tracked, ...once]){ tAvail += st[e.id].avail; tSpent += st[e.id].spent; }
   tAvail = r2(tAvail); tSpent = r2(tSpent);
   const tLeft = r2(tAvail - tSpent);
   const closed = !!periodEnd(k), exp = expectedEnd(k), t = todayISO();
@@ -510,15 +598,17 @@ function viewEnvelopes(){
     : t < periodStart(k) ? `Começa em ${esc(shortDate(periodStart(k)))}`
     : `Desde ${esc(shortDate(periodStart(k)))} · ${Math.round(frac*100)}%<br>~${diffDays(t, exp) + 1} dias até ${esc(shortDate(addDays(exp, 1)))}`;
   const folders = [];
-  for (const e of list){ const fk = e.folder || "Sem pasta"; let g = folders.find(x => x.k === fk); if (!g) folders.push(g = {k:fk, items:[]}); g.items.push(e); }
+  for (const e of tracked){ const fk = e.folder || "Sem pasta"; let g = folders.find(x => x.k === fk); if (!g) folders.push(g = {k:fk, items:[], priv:!!e.private}); g.items.push(e); }
   const fl = (key, txt) => `<button class="chip" data-act="filter" data-k="${esc(key)}" aria-pressed="${f===key}">${esc(txt)}</button>`;
-  const owners = activeMembers().filter(m => envs().some(e => e.type !== "comum" && e.owner === m.id));
+  const hasMine = priv.length || group.some(e => e.type === "pessoal" && e.owner === S.me);
   return pastBanner() + `
-  <div class="chips" role="group" aria-label="Filtro">${fl("all","Todos")}${fl("comum","Em comum")}${owners.map(m => fl(m.id, m.name)).join("")}</div>
-  ${folders.length ? folders.map(g => {
+  <div class="chips" role="group" aria-label="Filtro">${fl("all","Todos")}${fl("comum","Compartilhados")}${hasMine ? fl("mine","Só meus") : ""}</div>
+  ${folders.map(g => {
     const gl = r2(g.items.reduce((s,e) => s + st[e.id].left, 0));
-    return `<section class="folder"><div class="folder-h"><h2>${esc(g.k)}</h2><span class="num">${plain(gl)}</span></div><div class="card">${g.items.map(e => envRow(e, st[e.id], frac)).join("")}</div></section>`;
-  }).join("") : `<div class="empty"><p>Nenhum envelope neste filtro.</p></div>`}
+    return `<section class="folder"><div class="folder-h"><h2>${esc(g.k)}${g.priv ? ` <span class="lock" title="Só você vê">🔒</span>` : ""}</h2><span class="num">${plain(gl)}</span></div><div class="card">${g.items.map(e => envRow(e, st[e.id], frac)).join("")}</div></section>`;
+  }).join("")}
+  ${once.length ? `<section class="folder"><div class="folder-h"><h2>Pagamentos únicos</h2><span class="num">${plain(r2(once.reduce((s,e) => s + Math.max(0, st[e.id].left), 0)))}</span></div><div class="card">${once.map(e => onceRow(e, st[e.id])).join("")}</div></section>` : ""}
+  ${!folders.length && !once.length ? `<div class="empty"><p>Nenhum envelope neste filtro.</p></div>` : ""}
   <section class="summary" style="margin-top:4px">
     <div class="row1">
       <div><div class="lbl">Disponível agora</div><div class="big num ${tLeft<0?"neg":""}">${money(tLeft)}</div></div>
@@ -530,8 +620,23 @@ function viewEnvelopes(){
       <div><div class="lbl">Usado</div><div class="v num">${tAvail>0?Math.round(tSpent/tAvail*100):0}%</div></div>
     </div>
   </section>
-  <p class="note" style="margin:-2px 4px 12px">Toque num envelope para lançar um gasto; ⋯ abre os detalhes. A barra mostra quanto resta e o traço, onde ela deveria estar pelo ritmo do período.</p>
-  <div class="btnrow" style="margin-top:6px"><button class="btn ghost" data-act="transfer">Transferir entre envelopes</button><button class="btn ghost" data-act="extra">Acrescentar valor</button></div>`;
+  <p class="note" style="margin:-2px 4px 12px">Toque num envelope para lançar um gasto; ⋯ abre os detalhes. Valores e divisão de cada despesa se definem no Meu caixa. 🔒 = só você vê.</p>
+  ${group.length ? `<div class="btnrow" style="margin-top:6px"><button class="btn ghost" data-act="transfer">Transferir entre envelopes</button><button class="btn ghost" data-act="extra">Acrescentar valor</button></div>` : ""}`;
+}
+/* Pagamento único (ex.: aluguel): uma linha com quem pagou; tocar registra o pagamento já com o valor que falta. */
+function payersOf(envId){ const w = [...new Set(S.tx.filter(t => t.kind === "expense" && t.env === envId).map(t => t.by))]; return w.map(nameOf).join(", "); }
+function onceRow(e, s){
+  const paid = s.avail > 0 ? s.left <= 0.004 : s.spent > 0;
+  const part = s.spent > 0 && !paid;
+  const sub = paid ? `Pago por ${esc(payersOf(e.id))}` : part ? `Pago ${plain(s.spent)} por ${esc(payersOf(e.id))} · falta ${plain(s.left)}` : "A pagar";
+  return `<div class="env ${paid ? "good" : "none"}">
+    <button class="env-go once" data-act="payEnv" data-id="${esc(e.id)}" aria-label="${esc(e.name)}: ${paid ? "pago" : "registrar pagamento"}">
+      <span class="nm"><span class="check sm ${paid ? "on" : ""}" aria-hidden="true"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5 9-10"/></svg></span><span class="name">${esc(e.name)}</span></span>
+      <span class="amt num">${plain(s.avail)}</span>
+      <span class="of" style="text-align:left;white-space:normal">${sub}</span>
+    </button>
+    <button class="env-more" data-act="openEnv" data-id="${esc(e.id)}" aria-label="Detalhes de ${esc(e.name)}"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button>
+  </div>`;
 }
 /* Linha compacta: toque na linha = lançar gasto; botão ⋯ = detalhes do envelope.
    A barra mostra o que RESTA (cheia no início, esvazia com os gastos).
@@ -545,7 +650,7 @@ function envRow(e, s, frac){
   const sk = status(s, frac);
   const w = leftFrac(s) * 100, ov = overFrac(s) * 100;
   const tick = frac > 0 && frac < 1 ? `<b style="left:calc(${((1 - frac) * 100).toFixed(1)}% - 1px)"></b>` : "";
-  const who = e.type === "comum" ? "" : `<span class="od" style="${pc(e.owner)}" title="Pessoal de ${esc(nameOf(e.owner))}">${esc(initials(e.owner))}</span>`;
+  const who = e.type === "comum" || e.private ? "" : `<span class="od" style="${pc(e.owner)}" title="Pessoal de ${esc(nameOf(e.owner))}">${esc(initials(e.owner))}</span>`;
   return `<div class="env ${sk.k}">
     <button class="env-go" data-act="spendIn" data-id="${esc(e.id)}" aria-label="Lançar gasto em ${esc(e.name)}. Resta ${esc(money(s.left))} de ${esc(money(s.avail))}. ${sk.t}.">
       <span class="nm">${who}<span class="name">${esc(e.name)}</span></span>
@@ -557,9 +662,17 @@ function envRow(e, s, frac){
   </div>`;
 }
 
+/* Gastos dos envelopes privados no formato de lançamento (só para a dona; nunca vão para o grupo). */
+function privTx(onlyItem){
+  const out = [];
+  for (const i of ledItems()) if (i.kind === "out" && !i.shared && (!onlyItem || i.id === onlyItem)) for (const sp of (i.spends || [])) out.push({kind:"expense", private:true, item:i.id, sid:sp.id, id:"p:" + i.id + ":" + sp.id, amount:sp.amount, desc:sp.desc, date:sp.date, ts:sp.ts, env:"p:" + i.id, by:S.me});
+  return out;
+}
 function txLine(t){
-  const e = envById(t.env), f = envById(t.from), to = envById(t.to);
+  const e = envAny(t.env), f = envById(t.from), to = envById(t.to);
   let title, sub, val, cls;
+  if (t.private){ title = t.desc || (e ? e.name : "Gasto"); sub = `🔒 ${e?esc(e.name):"Envelope removido"} · só você vê`; val = "−" + money(t.amount); cls = "out";
+    return `<button class="li" data-act="openPSpend" data-id="${esc(t.item)}" data-k="${esc(t.sid)}">${dot(S.me)}<div class="grow"><div class="t">${esc(title)}</div><div class="s">${sub}</div></div><div class="v num ${cls}">${val}</div></button>`; }
   if (t.kind === "expense"){ title = t.desc || (e ? e.name : "Gasto"); sub = `${e?esc(e.name):"Envelope removido"} · ${esc(nameOf(t.by))}`; val = "−" + money(t.amount); cls = "out"; }
   else if (t.kind === "extra"){ title = t.desc || "Valor acrescentado"; sub = `para ${e?esc(e.name):"envelope removido"} · ${esc(nameOf(t.by))}`; val = "+" + money(t.amount); cls = "in"; }
   else { title = t.desc || "Transferência"; sub = `${f?esc(f.name):"?"} → ${to?esc(to.name):"?"} · ${esc(nameOf(t.by))}`; val = money(t.amount); cls = "mv"; }
@@ -567,8 +680,8 @@ function txLine(t){
 }
 function sortTx(list){ return [...list].sort((a,b) => String(b.date||"").localeCompare(String(a.date||"")) || (b.ts||0) - (a.ts||0)); }
 function viewTx(){
-  if (!S.monthDoc) return pastBanner() + `<div class="empty"><h3>Período sem envelopes</h3><p>Monte os envelopes para começar a lançar gastos.</p></div>`;
-  const list = sortTx(S.tx);
+  if (!envs().length && !privEnvs().length && !S.tx.length) return pastBanner() + `<div class="empty"><h3>Período sem envelopes</h3><p>Cadastre as despesas no Meu caixa para criar os envelopes.</p></div>`;
+  const list = sortTx([...S.tx, ...privTx()]);
   if (!list.length) return pastBanner() + `<div class="empty"><h3>Nenhum lançamento ainda</h3><p>Toque em “Gasto” para registrar a primeira compra do período. Ela aparece na hora nos outros celulares.</p></div>`;
   let html = pastBanner(), cur = null, buf = [];
   const flush = () => { if (buf.length) html += `<div class="dayh">${esc(dayLabel(cur))}</div><div class="list">${buf.join("")}</div>`; buf = []; };
@@ -578,7 +691,7 @@ function viewTx(){
 }
 
 function viewBalance(){
-  if (!S.monthDoc) return `<div class="empty"><h3>Período sem envelopes</h3><p>O acerto aparece quando houver envelopes e gastos.</p></div>`;
+  if (!S.monthDoc) return `<div class="empty"><h3>Período sem envelopes compartilhados</h3><p>O acerto aparece quando houver despesas compartilhadas (cadastradas no Meu caixa) e gastos nelas.</p></div>`;
   const z = settlement();
   const settled = S.monthDoc.settlement && typeof S.monthDoc.settlement === "object" ? S.monthDoc.settlement : null;
   const ids = Object.keys(z.people).sort((a,b) => memberIndex(a) - memberIndex(b));
@@ -600,49 +713,109 @@ function viewBalance(){
     ${ids.map(k => { const p = z.people[k]; return `<div class="person"><div class="hd">${dot(k)}<span style="min-width:0;overflow-wrap:anywhere">${esc(nameOf(k))}</span></div>
       <div class="kv"><span>Pagou (comum)</span><b class="num">${money(p.comum)}</b></div>
       <div class="kv"><span>Parte (${shareLabel(z.shares[k] || 0)})</span><b class="num">${money(p.share)}</b></div>
-      <div class="kv"><span>Pessoal</span><b class="num">${money(p.pessoal)}</b></div>
-      <div class="kv" style="border-top:1px solid var(--line);margin-top:4px;padding-top:6px"><span>Total</span><b class="num">${money(p.comum + p.pessoal)}</b></div>
+      ${p.pessoal ? `<div class="kv"><span>Pessoal (antigo)</span><b class="num">${money(p.pessoal)}</b></div>` : ""}
+      <div class="kv" style="border-top:1px solid var(--line);margin-top:4px;padding-top:6px"><span>Saldo</span><b class="num">${money(p.comum - p.share)}</b></div>
     </div>`; }).join("")}
   </div>
   <h3 class="section-h" style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><span>Envelopes em comum</span><span class="num">${money(z.total)}</span></h3>
   <div class="list" style="overflow-x:auto"><table class="tbl num"><thead><tr><th>Envelope</th>${ids.map(k => `<th>${esc(nameOf(k))}</th>`).join("")}</tr></thead>
-  <tbody>${comumEnvs.map(e => { const p = z.perEnv[e.id] || {}; return `<tr><td>${esc(e.name)}</td>${ids.map(k => `<td>${money(p[k] || 0)}</td>`).join("")}</tr>`; }).join("") || `<tr><td colspan="${ids.length+1}">Nenhum envelope em comum.</td></tr>`}</tbody>
+  <tbody>${comumEnvs.map(e => { const p = z.perEnv[e.id] || {}; return `<tr><td>${esc(e.name)}<div style="font-size:11px;color:var(--muted);font-weight:400">${esc(splitLabel(envSplit(e)))}</div></td>${ids.map(k => `<td>${money(p[k] || 0)}</td>`).join("")}</tr>`; }).join("") || `<tr><td colspan="${ids.length+1}">Nenhum envelope em comum.</td></tr>`}</tbody>
   <tfoot><tr><td>Total</td>${ids.map(k => `<td>${money(z.people[k].comum)}</td>`).join("")}</tr></tfoot></table></div>
-  <p class="note">Só os gastos lançados em envelopes “Em comum” entram no acerto. Divisão: ${activeMembers().map(m => `${esc(m.name)} ${shareLabel(z.shares[m.id] || 0)}`).join(" · ")} (mude em Ajustes › Pessoas e divisão).</p>
+  <p class="note">Só os gastos em despesas compartilhadas entram no acerto. Cada uma usa a divisão escolhida no Meu caixa de quem a cadastrou (mostrada embaixo do nome); as que não têm divisão própria usam a padrão do grupo: ${activeMembers().map(m => `${esc(m.name)} ${shareLabel(z.shares[m.id] || 0)}`).join(" · ")} (Ajustes › Pessoas e divisão).</p>
   <div style="margin-top:14px">${settled
     ? `<div class="banner" style="background:var(--good-soft)"><span>Acerto marcado como pago em ${esc(shortDate(settled.date))}${sTr.length ? ": " + sTr.map(t => `${esc(nameOf(t.from))} → ${esc(nameOf(t.to))} ${money(t.amount)}`).join("; ") : ""}.</span><button data-act="unsettle">Desfazer</button></div>
        ${stale ? `<div class="banner"><span>Houve gastos em comum depois do acerto (total mudou de ${money(settled.total)} para ${money(z.total)}).</span><button data-act="settle">Atualizar</button></div>` : ""}`
     : (tr.length ? `<button class="btn block" data-act="settle">Marcar acerto como pago</button>` : "")}</div>`;
 }
 
-/* ---- caixa pessoal ---- */
-function ledItems(){ return (S.ledger && Array.isArray(S.ledger.items)) ? S.ledger.items : []; }
+/* ---- Meu caixa ----
+   Rendas e despesas da pessoa. Despesas compartilhadas viram envelopes do grupo (e aparecem sozinhas
+   no caixa de quem divide, com a parte de cada um); despesas pessoais ficam só aqui. */
+const ICON_CHECK = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5 9-10"/></svg>`;
+const ICON_ENV = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"><rect x="3" y="6" width="18" height="13" rx="2"/><path d="M3 8l9 6 9-6"/></svg>`;
+const ICON_MORE = `<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg>`;
+/* Linhas de despesas compartilhadas no caixa: as minhas (do meu caixa) e as dos outros (dos envelopes do grupo). */
+function sharedRows(){
+  const items = ledItems(), st = envStats(), rows = [];
+  const mineIds = new Set(items.filter(i => i.kind === "out" && i.shared).map(i => i.id));
+  for (const i of items){
+    if (i.kind !== "out" || !i.shared) continue;
+    const e = envById(linkedEnvId(i.id));
+    const sp = i.split || shares(), pct = Number(sp[S.me]) || 0;
+    rows.push({mine:true, item:i, env:e, name:i.name, total:r2(i.amount), pct, part:r2(i.amount * pct / 100), mode:i.mode, split:sp, st: e ? st[e.id] : null});
+  }
+  for (const e of envs()){
+    if (e.type !== "comum") continue;
+    if (e.src && e.src.uid === S.uid && mineIds.has(e.src.item)) continue;
+    const sp = envSplit(e), pct = Number(sp[S.me]) || 0;
+    if (pct <= 0) continue;
+    rows.push({mine:false, env:e, name:e.name, total:r2(e.budget), pct, part:r2(e.budget * pct / 100), mode:e.mode, split:sp, st:st[e.id], from: e.src ? e.src.uid : null});
+  }
+  return rows;
+}
 function viewLedger(){
   if (!S.uid) return `<div class="empty"><h3>Caixa pessoal indisponível</h3><p>Entre com sua conta para guardar rendas e despesas só suas.</p></div>`;
+  if (!S.ledgerMonth) return `<div class="empty"><h3>Nenhum período aberto</h3><p>Inicie um período em Ajustes para montar o caixa.</p></div>`;
   if (!S.ledgerLoaded) return `<div class="empty"><h3>Abrindo seu caixa…</h3></div>`;
   const items = ledItems();
-  const inc = items.filter(i => i.kind === "in"), out = items.filter(i => i.kind !== "in");
+  const inc = items.filter(i => i.kind === "in"), pers = items.filter(i => i.kind === "out" && !i.shared);
+  const shared = sharedRows();
   const sum = a => r2(a.reduce((s,i) => s + r2(i.amount), 0));
-  const R = sum(inc), D = sum(out), paid = sum(out.filter(i => i.paid)), rec = sum(inc.filter(i => i.paid));
+  const R = sum(inc), rec = sum(inc.filter(i => i.paid));
+  const DP = sum(pers), DS = r2(shared.reduce((s,r) => s + r.part, 0)), D = r2(DP + DS);
   const saldo = r2(R - D);
-  const row = i => `<div class="lrow ${i.paid?"paid":""}">
-    <button class="check ${i.paid?"on":""}" data-act="ledPaid" data-id="${esc(i.id)}" aria-label="${i.kind==="in"?"Recebido":"Pago"}: ${esc(i.name)}" aria-pressed="${!!i.paid}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5 9-10"/></svg></button>
+  const legacy = envs().filter(e => e.type === "pessoal" && e.owner === S.me);
+
+  const incRow = i => `<div class="lrow ${i.paid?"paid":""}">
+    <button class="check ${i.paid?"on":""}" data-act="ledPaid" data-id="${esc(i.id)}" aria-label="Recebido: ${esc(i.name)}" aria-pressed="${!!i.paid}">${ICON_CHECK}</button>
     <div style="min-width:0"><div class="t">${esc(i.name)}</div>${i.date?`<div class="date">${esc(shortDate(i.date))}</div>`:""}</div>
-    <div class="v num ${i.kind==="in"?"in":"out"}">${i.kind==="in"?"+":"−"} ${money(i.amount)}</div>
-    <button class="more" data-act="ledEdit" data-id="${esc(i.id)}" aria-label="Editar ${esc(i.name)}"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg></button>
+    <div class="v num in">+ ${money(i.amount)}</div>
+    <button class="more" data-act="ledEdit" data-id="${esc(i.id)}" aria-label="Editar ${esc(i.name)}">${ICON_MORE}</button>
   </div>`;
-  const prevK = addMonth(S.ledgerMonth, -1);
-  return `<div class="ledger-sum">
-    <div class="ls hero"><div class="lbl">Sobra do período</div><div class="v num" style="color:${saldo<0?"var(--bad)":"var(--good)"}">${saldo<0?"−":"+"} ${money(Math.abs(saldo))}</div><div style="font-size:12px;color:var(--muted)">Visível só para você</div></div>
+  const persRow = i => {
+    const track = i.mode === "track", ps = track ? privStats(i) : null;
+    const lead = track
+      ? `<button class="check ic" data-act="openEnv" data-id="p:${esc(i.id)}" aria-label="Envelope de ${esc(i.name)}">${ICON_ENV}</button>`
+      : `<button class="check ${i.paid?"on":""}" data-act="ledPaid" data-id="${esc(i.id)}" aria-label="Pago: ${esc(i.name)}" aria-pressed="${!!i.paid}">${ICON_CHECK}</button>`;
+    const sub = track ? `Envelope privado · gasto ${money(ps.spent)} · resta <b style="color:${ps.left<0?"var(--bad)":"inherit"}">${money(ps.left)}</b>` : `Pagamento único${i.date ? ` · <span class="date">${esc(shortDate(i.date))}</span>` : ""}`;
+    return `<div class="lrow ${!track && i.paid?"paid":""}">${lead}
+      <div style="min-width:0"><div class="t">${esc(i.name)}</div><div class="s">${sub}</div></div>
+      <div class="v num out">− ${money(i.amount)}</div>
+      <button class="more" data-act="ledEdit" data-id="${esc(i.id)}" aria-label="Editar ${esc(i.name)}">${ICON_MORE}</button>
+    </div>`;
+  };
+  const shRow = r => {
+    const s = r.st, envId = r.env ? r.env.id : "";
+    const paid = s && (s.avail > 0 ? s.left <= 0.004 : s.spent > 0);
+    let lead, status;
+    if (!r.env) { lead = `<span class="check ic" aria-hidden="true">${ICON_ENV}</span>`; status = "Envelope ainda não criado neste período"; }
+    else if (r.mode === "once"){ lead = `<button class="check ${paid?"on":""}" data-act="payEnv" data-id="${esc(envId)}" aria-label="${paid ? "Pago" : "Registrar pagamento"}: ${esc(r.name)}" aria-pressed="${!!paid}">${ICON_CHECK}</button>`;
+      status = paid ? `Pago por ${esc(payersOf(envId))}` : s.spent > 0 ? `Pago ${money(s.spent)} · falta ${money(s.left)}` : "Pagamento único · a pagar"; }
+    else { lead = `<button class="check ic" data-act="openEnv" data-id="${esc(envId)}" aria-label="Envelope de ${esc(r.name)}">${ICON_ENV}</button>`;
+      status = `Envelope · gasto ${money(s.spent)} de ${money(s.avail)}`; }
+    const who = r.mine ? "" : r.from ? ` · de ${esc(nameOf(r.from))}` : " · do grupo";
+    return `<div class="lrow ${r.mode === "once" && paid ? "paid" : ""}">${lead}
+      <div style="min-width:0"><div class="t">${esc(r.name)}</div><div class="s">Sua parte ${shareLabel(r.pct)} de ${money(r.total)}${who}</div><div class="s">${status}</div></div>
+      <div class="v num out">− ${money(r.part)}</div>
+      ${r.mine ? `<button class="more" data-act="ledEdit" data-id="${esc(r.item.id)}" aria-label="Editar ${esc(r.name)}">${ICON_MORE}</button>`
+        : r.env ? `<button class="more" data-act="openEnv" data-id="${esc(envId)}" aria-label="Detalhes de ${esc(r.name)}">${ICON_MORE}</button>` : `<span></span>`}
+    </div>`;
+  };
+  const legacyBox = legacy.length ? `<div class="banner"><span>Você tem ${legacy.length} ${legacy.length===1?"envelope pessoal visível":"envelopes pessoais visíveis"} ao grupo neste período (${esc(legacy.slice(0,3).map(e => e.name).join(", "))}${legacy.length>3?"…":""}). Traga para o caixa: viram envelopes privados, com os gastos já lançados.</span><button data-act="askMigrate">Trazer</button></div><div id="migBox"></div>` : "";
+  const nothing = !items.length && !shared.length;
+  return `${legacyBox}<div class="ledger-sum">
+    <div class="ls hero"><div class="lbl">Sobra do período</div><div class="v num" style="color:${saldo<0?"var(--bad)":"var(--good)"}">${saldo<0?"−":"+"} ${money(Math.abs(saldo))}</div><div style="font-size:12px;color:var(--muted)">Renda menos despesas (das compartilhadas, só a sua parte). Visível só para você.</div></div>
     <div class="ls"><div class="lbl">Renda</div><div class="v num" style="color:var(--good)">${money(R)}</div><div style="font-size:12px;color:var(--muted)">Recebido ${money(rec)}</div></div>
-    <div class="ls"><div class="lbl">Despesas</div><div class="v num" style="color:var(--bad)">${money(D)}</div><div style="font-size:12px;color:var(--muted)">Pago ${money(paid)} · falta ${money(D-paid)}</div></div>
+    <div class="ls"><div class="lbl">Despesas</div><div class="v num" style="color:var(--bad)">${money(D)}</div><div style="font-size:12px;color:var(--muted)">Compartilhadas ${money(DS)} · pessoais ${money(DP)}</div></div>
   </div>
-  ${!items.length ? `<div class="empty"><h3>Caixa de ${esc(monthLabel(S.ledgerMonth))} vazio</h3><p>Lance salário, auxílios, aluguel e contas fixas. O app soma e mostra quanto sobra.</p>
+  ${nothing ? `<div class="empty"><h3>Caixa de ${esc(monthLabel(S.ledgerMonth))} vazio</h3><p>Lance rendas e todas as despesas do mês. As compartilhadas viram envelopes do grupo; as pessoais ficam só com você.</p>
      <div class="btnrow"><button class="btn" data-act="ledAdd" data-k="in">Adicionar renda</button><button class="btn ghost" data-act="ledAdd" data-k="out">Adicionar despesa</button></div>
-     <p style="margin-top:12px"><button class="btn ghost" data-act="ledCopy">Copiar itens de ${esc(monthLabel(prevK))}</button></p></div>`
-  : `<h3 class="section-h">Rendas</h3><div class="list">${inc.map(row).join("") || `<div class="li"><span class="s">Nenhuma renda lançada.</span></div>`}</div>
-     <h3 class="section-h">Despesas</h3><div class="list">${out.map(row).join("") || `<div class="li"><span class="s">Nenhuma despesa lançada.</span></div>`}</div>
-     <div class="btnrow" style="margin-top:14px"><button class="btn" data-act="ledAdd" data-k="in">Adicionar renda</button><button class="btn danger" data-act="ledAdd" data-k="out">Adicionar despesa</button></div>`}`;
+     <p style="margin-top:12px"><button class="btn ghost" data-act="ledCopy">Repetir itens de ${esc(monthLabel(prevPeriodKey(S.ledgerMonth)))}</button></p></div>`
+  : `<h3 class="section-h">Rendas</h3><div class="list">${inc.map(incRow).join("") || `<div class="li"><span class="s">Nenhuma renda lançada.</span></div>`}</div>
+     <h3 class="section-h">Despesas compartilhadas</h3><div class="list">${shared.map(shRow).join("") || `<div class="li"><span class="s">Nenhuma. Ao cadastrar uma despesa, marque “Compartilhada” para dividir com o grupo.</span></div>`}</div>
+     <h3 class="section-h">Despesas pessoais <span style="font-size:13px;color:var(--muted);font-family:var(--f-body);font-weight:600">· só você vê</span></h3><div class="list">${pers.map(persRow).join("") || `<div class="li"><span class="s">Nenhuma despesa pessoal.</span></div>`}</div>
+     <div class="btnrow" style="margin-top:14px"><button class="btn" data-act="ledAdd" data-k="in">Adicionar renda</button><button class="btn danger" data-act="ledAdd" data-k="out">Adicionar despesa</button></div>
+     ${!items.length ? `<p style="margin-top:10px"><button class="btn ghost block" data-act="ledCopy">Repetir meus itens de ${esc(monthLabel(prevPeriodKey(S.ledgerMonth)))}</button></p>` : ""}`}`;
 }
 
 /* App Android (APK montado pelo GitHub Actions, .github/workflows/apk.yml): o link aparece em Ajustes
@@ -668,15 +841,14 @@ function viewSettings(){
   <h3 class="section-h" style="margin-top:4px">Período</h3>
   <div class="list">
     ${s("newMonth", "Iniciar novo período", `Atual: ${esc(monthLabel(cm))}, ${esc(periodRange(cm))}. Use quando o pagamento cair.`)}
-    ${s("editMonth", "Envelopes deste período", `Editar valores, nomes e pastas de ${esc(monthLabel(S.viewMonth || cm))}`)}
+    ${s("editMonth", "Envelopes avulsos do período", `Envelopes em comum de ${esc(monthLabel(S.viewMonth || cm))} que não vêm de nenhum Meu caixa`)}
     ${s("history", "Períodos anteriores", `${S.months.length} ${S.months.length===1?"período salvo":"períodos salvos"}`)}
     ${canUndo ? s("askUndoPeriod", "Desfazer início do período", `Volta para ${esc(monthLabel(S.months[S.months.length-2]))}. Só aparece enquanto ${esc(monthLabel(cm))} não tem lançamentos.`) : ""}
   </div>
   <div id="undoBox"></div>
   <h3 class="section-h">Grupo${S.config.name ? " · " + esc(S.config.name) : ""}</h3>
   <div class="list">
-    ${s("editTemplate", "Pastas e envelopes padrão", `${(S.config.template||[]).length} envelopes no modelo, usados ao iniciar cada período`)}
-    ${s("setupPeople", "Pessoas e divisão", `${act.length} ${act.length===1?"pessoa":"pessoas"} · ${act.map(m => `${esc(m.name)} ${shareLabel(sh[m.id])}`).join(" · ")}`)}
+    ${s("setupPeople", "Pessoas e divisão padrão", `${act.length} ${act.length===1?"pessoa":"pessoas"} · ${act.map(m => `${esc(m.name)} ${shareLabel(sh[m.id])}`).join(" · ")}`)}
     <div class="li" style="display:block"><div class="t">Convidar pessoas</div>
       ${S.config.joinOpen === false
         ? `<div class="s" style="margin:2px 0 8px">Convites fechados: ninguém novo consegue entrar, nem com o código.</div>`
@@ -704,10 +876,12 @@ function openSheet(html, ctx){
   if (first){ try { first.focus({preventScroll:true}); } catch {} setTimeout(() => { const a = document.activeElement; if ((!a || a === document.body) && $("#sheetHost").contains(first)) first.focus(); }, 60); }
 }
 function closeSheet(){ $("#sheetHost").innerHTML = ""; sheetCtx = null; }
-function envOptions(sel){
+/* which: "all" (grupo + privados), "group" ou "private". */
+function envOptions(sel, which = "group"){
   const groups = {};
-  for (const e of envs()) (groups[e.folder || "Sem pasta"] ||= []).push(e);
-  return Object.entries(groups).map(([g, list]) => `<optgroup label="${esc(g)}">${list.map(e => `<option value="${esc(e.id)}" ${e.id===sel?"selected":""}>${esc(e.name)}${e.type==="comum"?" · comum":" · "+esc(nameOf(e.owner))}</option>`).join("")}</optgroup>`).join("");
+  if (which !== "private") for (const e of envs()) (groups[e.mode === "once" ? "Pagamentos únicos" : (e.folder || "Sem pasta")] ||= []).push(e);
+  if (which !== "group") for (const e of privEnvs()) (groups["🔒 Só você vê"] ||= []).push(e);
+  return Object.entries(groups).map(([g, list]) => `<optgroup label="${esc(g)}">${list.map(e => `<option value="${esc(e.id)}" ${e.id===sel?"selected":""}>${esc(e.name)}${e.private ? "" : e.type==="comum"?" · comum":" · "+esc(nameOf(e.owner))}</option>`).join("")}</optgroup>`).join("");
 }
 function whoPicker(sel){
   const list = activeMembers();
@@ -723,22 +897,26 @@ function dateBounds(k){ const s = periodStart(k), e = periodEnd(k); return `min=
 
 /* Gasto: aberto direto pelo toque no envelope (presetEnv). Ordem pensada para o mínimo de toques:
    valor (teclado numérico já aberto) → descrição com sugestões → Lançar. Envelope, data e quem pagou já vêm preenchidos. */
-function sheetExpense(tx, presetEnv){
-  const t = tx || {kind:"expense", amount:"", env: presetEnv || (envs()[0]||{}).id, desc:"", date: defaultDate(S.viewMonth), by: S.me};
-  const e0 = !tx && presetEnv ? envById(presetEnv) : null;
-  const s0 = e0 ? envStats()[e0.id] : null;
-  openSheet(`<h3>${tx ? "Editar gasto" : e0 ? esc(e0.name) : "Novo gasto"}</h3>
-  <p class="sub">${e0 ? `Resta <b class="num" style="color:${s0.left < 0 ? "var(--bad)" : "var(--ink)"}">${money(s0.left)}</b> de ${money(s0.avail)} neste envelope.` : "Sai do envelope escolhido e aparece nos outros celulares."}</p>
+function sheetExpense(tx, presetEnv, prefill){
+  const first = presetEnv || (envs().find(e => e.mode !== "once") || privEnvs()[0] || envs()[0] || {}).id;
+  const t = tx || {kind:"expense", amount: prefill || "", env: first, desc:"", date: defaultDate(S.viewMonth), by: S.me};
+  const e0 = !tx && presetEnv ? envAny(presetEnv) : null;
+  const s0 = e0 ? allStats()[e0.id] : null;
+  const isP = isPriv(t.env), once = e0 && e0.mode === "once";
+  const which = tx ? (tx.private ? "private" : "group") : "all";
+  openSheet(`<h3>${tx ? "Editar gasto" : once ? "Pagar " + esc(e0.name) : e0 ? esc(e0.name) : "Novo gasto"}</h3>
+  <p class="sub">${once ? `Pagamento único de ${money(s0.avail)}${s0.spent ? `; já pago ${money(s0.spent)}` : ""}. Marque quem pagou: entra no acerto pela divisão desta despesa.`
+    : e0 ? `Resta <b class="num" style="color:${s0.left < 0 ? "var(--bad)" : "var(--ink)"}">${money(s0.left)}</b> de ${money(s0.avail)} neste envelope.${e0.private ? " 🔒 Só você vê." : ""}` : "Sai do envelope escolhido. Envelopes 🔒 são só seus; os outros aparecem para o grupo."}</p>
   <form id="fx" novalidate>
     <div class="field"><label for="fxAmt">Valor (R$)</label><input class="inp money num" id="fxAmt" inputmode="decimal" autocomplete="off" placeholder="0,00" value="${esc(moneyInput(t.amount))}" autofocus></div>
     <div class="field"><label for="fxDesc">Descrição</label><input class="inp" id="fxDesc" placeholder="Ex.: feira, ração, Uber" value="${esc(t.desc)}" maxlength="80" autocomplete="off" autocapitalize="sentences">
       <div class="sugs" id="fxSugs" role="group" aria-label="Sugestões de descrição" hidden></div></div>
-    <div class="field"><label for="fxEnv">Envelope</label><select class="inp" id="fxEnv">${envOptions(t.env)}</select></div>
+    <div class="field"><label for="fxEnv">Envelope</label><select class="inp" id="fxEnv">${envOptions(t.env, which)}</select></div>
     <div class="field"><label for="fxDate">Data <span style="font-weight:400">(${esc(monthLabel(S.viewMonth))}: ${esc(periodRange(S.viewMonth))})</span></label><input class="inp" type="date" id="fxDate" value="${esc(t.date)}" ${dateBounds(S.viewMonth)}></div>
-    <div class="field"><label>Quem pagou</label>${whoPicker(t.by || S.me)}</div>
+    <div class="field" id="fxByBox" ${isP ? "hidden" : ""}><label>Quem pagou</label>${whoPicker(t.by || S.me)}</div>
     <p class="err" id="fxErr" hidden></p>
-    ${formButtons(tx, "Lançar gasto")}
-  </form>`, {type:"tx", id: tx && tx.id, kind:"expense", fixedEnv: !!(tx || presetEnv), pool: suggestPool(), sugs: []});
+    ${formButtons(tx && !tx.private ? tx : tx ? {} : null, once ? "Registrar pagamento" : "Lançar gasto")}
+  </form>`, {type:"tx", id: tx && (tx.private ? tx.sid : tx.id), item: tx && tx.private ? tx.item : null, private: !!(tx && tx.private), kind:"expense", fixedEnv: !!(tx || presetEnv), pool: suggestPool(), sugs: []});
   drawSugs();
 }
 function drawSugs(){
@@ -773,26 +951,47 @@ function sheetExtra(tx, presetEnv){
   </form>`, {type:"tx", id: tx && tx.id, kind:"extra", date:t.date, by:t.by});
 }
 function sheetEnvelope(id){
-  const e = envById(id); if (!e) return;
+  const e = envAny(id); if (!e) return;
+  if (e.private){
+    const i = privItem(id), s = privStats(i), sk = status(s, periodFrac(S.viewMonth));
+    const mine = sortTx(privTx(i.id));
+    openSheet(`<h3>${esc(e.name)}</h3><p class="sub">🔒 Envelope privado: só você vê · <span class="st ${sk.k}">${sk.t}</span></p>
+    <div class="summary" style="box-shadow:none">
+      <div class="lbl">Resta no envelope</div><div class="big num ${s.left<0?"neg":""}">${money(s.left)}</div>
+      <div class="kv" style="margin-top:12px"><span>Previsto no Meu caixa</span><b class="num">${money(s.budget)}</b></div>
+      <div class="kv"><span>Gasto</span><b class="num">− ${money(s.spent)}</b></div>
+    </div>
+    <div class="btnrow" style="margin-bottom:16px"><button class="btn" data-act="spendIn" data-id="${esc(id)}">Gastar</button><button class="btn ghost" data-act="ledEdit" data-id="${esc(i.id)}">Editar no caixa</button></div>
+    ${mine.length ? `<div class="list">${mine.map(txLine).join("")}</div>` : `<p class="note">Nenhum gasto neste envelope ainda.</p>`}`, {type:"env"});
+    return;
+  }
   const s = envStats()[id], sk = status(s, periodFrac(S.viewMonth));
   const mine = sortTx(S.tx.filter(t => t.env === id || t.from === id || t.to === id));
-  openSheet(`<h3>${esc(e.name)}</h3><p class="sub">${esc(e.folder || "Sem pasta")} · ${e.type==="comum"?"Em comum":"Pessoal de "+esc(nameOf(e.owner))} · <span class="st ${sk.k}">${sk.t}</span></p>
+  const once = e.mode === "once";
+  const origin = e.type !== "comum" ? "Pessoal de " + esc(nameOf(e.owner)) + " (antigo)"
+    : `Compartilhada · ${esc(splitLabel(envSplit(e)))}${e.split ? "" : " (divisão padrão)"}`;
+  const by = e.src ? (e.src.uid === S.uid ? "Cadastrada no seu Meu caixa" : `Cadastrada por ${esc(nameOf(e.src.uid))}: só ela/ele muda valor e divisão`) : "Envelope avulso (Ajustes › Envelopes avulsos)";
+  openSheet(`<h3>${esc(e.name)}</h3><p class="sub">${esc(e.folder || "Sem pasta")} · ${origin} · ${once ? "Pagamento único" : `<span class="st ${sk.k}">${sk.t}</span>`}</p>
   <div class="summary" style="box-shadow:none">
-    <div class="lbl">Resta no envelope</div><div class="big num ${s.left<0?"neg":""}">${money(s.left)}</div>
-    <div class="kv" style="margin-top:12px"><span>Orçado no período</span><b class="num">${money(s.budget)}</b></div>
+    <div class="lbl">${once ? "Falta pagar" : "Resta no envelope"}</div><div class="big num ${s.left<0?"neg":""}">${money(once ? Math.max(0, s.left) : s.left)}</div>
+    <div class="kv" style="margin-top:12px"><span>${once ? "Valor" : "Orçado no período"}</span><b class="num">${money(s.budget)}</b></div>
     ${s.extra?`<div class="kv"><span>Valores extras</span><b class="num">+ ${money(s.extra)}</b></div>`:""}
     ${s.tin?`<div class="kv"><span>Recebido de outros envelopes</span><b class="num">+ ${money(s.tin)}</b></div>`:""}
     ${s.tout?`<div class="kv"><span>Enviado para outros envelopes</span><b class="num">− ${money(s.tout)}</b></div>`:""}
-    <div class="kv"><span>Gasto</span><b class="num">− ${money(s.spent)}</b></div>
+    <div class="kv"><span>${once ? "Pago" : "Gasto"}</span><b class="num">− ${money(s.spent)}</b></div>
   </div>
-  <div class="btnrow" style="margin-bottom:16px"><button class="btn" data-act="spendIn" data-id="${esc(id)}">Gastar</button><button class="btn ghost" data-act="transferFrom" data-id="${esc(id)}">Transferir</button><button class="btn ghost" data-act="extraIn" data-id="${esc(id)}">+ Valor</button></div>
+  <p class="note" style="margin:-4px 4px 12px">${by}.</p>
+  <div class="btnrow" style="margin-bottom:16px">${once
+    ? `<button class="btn" data-act="payEnv" data-id="${esc(id)}">Registrar pagamento</button>`
+    : `<button class="btn" data-act="spendIn" data-id="${esc(id)}">Gastar</button><button class="btn ghost" data-act="transferFrom" data-id="${esc(id)}">Transferir</button><button class="btn ghost" data-act="extraIn" data-id="${esc(id)}">+ Valor</button>`}</div>
   ${mine.length ? `<div class="list">${mine.map(txLine).join("")}</div>` : `<p class="note">Nenhum movimento neste envelope ainda.</p>`}`, {type:"env"});
 }
 
 /* editor de envelopes: modelo padrão ou período */
-function sheetEditor(mode, fromTemplate){
-  const src = mode === "template" || fromTemplate ? (Array.isArray(S.config.template) ? S.config.template.map(cleanEnv).filter(Boolean) : []) : envs();
-  openSheet("", {type:"editor", mode, rows: src.map(e => ({...e}))});
+/* Só os envelopes avulsos (sem vínculo com um Meu caixa). Os que vêm do caixa mudam só no caixa de quem os criou. */
+function sheetEditor(mode){
+  const src = envs().filter(e => !e.src);
+  openSheet("", {type:"editor", mode:"month", rows: src.map(e => ({...e}))});
   drawEditor();
 }
 function usedEnvIds(){ const u = new Set(); for (const t of S.tx){ if (t.env) u.add(t.env); if (t.from) u.add(t.from); if (t.to) u.add(t.to); } return u; }
@@ -801,10 +1000,9 @@ function drawEditor(){
   const folders = [...new Set(rows.map(r => r.folder).filter(Boolean))];
   const total = rows.reduce((s,r) => s + (isFinite(r.budget) ? r2(r.budget) : 0), 0);
   const used = c.mode === "month" ? usedEnvIds() : new Set();
-  const mem = activeMembers();
   $("#sheetHost .sheet").innerHTML = `<div class="grab"></div>
-  <h3>${c.mode === "template" ? "Modelo padrão" : "Envelopes de " + esc(monthLabel(S.viewMonth))}</h3>
-  <p class="sub">${c.mode === "template" ? "Estas pastas e envelopes são copiados ao iniciar cada período." : "Mudanças valem só para este período. Os lançamentos já feitos continuam."} Total orçado: <b class="num">${money(total)}</b></p>
+  <h3>Envelopes avulsos de ${esc(monthLabel(S.viewMonth))}</h3>
+  <p class="sub">Envelopes em comum que não vêm de nenhum Meu caixa (divisão padrão do grupo). Os que vêm do caixa mudam só lá, no caixa de quem os criou. Total: <b class="num">${money(total)}</b></p>
   <datalist id="folderList">${folders.map(f => `<option value="${esc(f)}">`).join("")}</datalist>
   ${rows.map((r,i) => `<div class="edrow">
     <input class="inp full" id="ed-n-${i}" data-ed="name" data-i="${i}" value="${esc(r.name)}" placeholder="Nome do envelope" aria-label="Nome" maxlength="60">
@@ -812,8 +1010,7 @@ function drawEditor(){
     <input class="inp num" id="ed-b-${i}" data-ed="budget" data-i="${i}" value="${esc(moneyInput(r.budget))}" inputmode="decimal" placeholder="R$" aria-label="Valor">
     <select class="inp" id="ed-t-${i}" data-ed="type" data-i="${i}" aria-label="Tipo">
       <option value="comum" ${r.type==="comum"?"selected":""}>Em comum</option>
-      ${mem.map(m => `<option value="${esc(m.id)}" ${r.type!=="comum"&&r.owner===m.id?"selected":""}>Pessoal · ${esc(m.name)}</option>`).join("")}
-      ${r.type!=="comum" && r.owner && !mem.find(m => m.id === r.owner) ? `<option value="${esc(r.owner)}" selected>Pessoal · ${esc(nameOf(r.owner))}</option>` : ""}
+      ${r.type!=="comum" && r.owner ? `<option value="${esc(r.owner)}" selected>Pessoal · ${esc(nameOf(r.owner))} (antigo)</option>` : ""}
     </select>
     <div class="actions">${used.has(r.id)
       ? `<span class="s" style="font-size:12px;color:var(--muted);align-self:center">Tem lançamentos: não dá para remover</span>`
@@ -821,8 +1018,7 @@ function drawEditor(){
   </div>`).join("")}
   <button class="btn ghost block" type="button" data-act="edAdd" style="margin:4px 0 14px">+ Adicionar envelope</button>
   <p class="err" id="edErr" hidden></p>
-  <div class="btnrow"><button class="btn" type="button" data-act="edSave">Salvar</button><button class="btn ghost" type="button" data-act="close">Cancelar</button></div>
-  ${c.mode === "month" ? `<button class="btn ghost block" type="button" data-act="edToTemplate" style="margin-top:10px">Salvar também como modelo padrão</button>` : ""}`;
+  <div class="btnrow"><button class="btn" type="button" data-act="edSave">Salvar</button><button class="btn ghost" type="button" data-act="close">Cancelar</button></div>`;
 }
 function readEditorInputs(){
   document.querySelectorAll("[data-ed]").forEach(el => {
@@ -841,9 +1037,9 @@ function cleanRows(){
   for (const r of sheetCtx.rows){
     if (!r.name) continue;
     const owner = r.type === "comum" ? null : (r.owner || S.me);
-    out.push({id: String(r.id || rid()).slice(0, 40), name: r.name.slice(0,60), folder: (r.folder||"").slice(0,40) || "Geral", budget: r2(r.budget), type: r.type === "comum" ? "comum" : "pessoal", owner});
+    out.push({id: String(r.id || rid()).slice(0, 40), name: r.name.slice(0,60), folder: (r.folder||"").slice(0,40) || "Geral", budget: r2(r.budget), type: r.type === "comum" ? "comum" : "pessoal", owner, mode: r.mode === "once" ? "once" : "track"});
   }
-  if (!out.length) return {error:"Crie pelo menos um envelope com nome."};
+  out.push(...envs().filter(e => e.src));          // os vindos do Meu caixa continuam iguais
   if (out.length > 150) return {error:"Máximo de 150 envelopes."};
   const order = [...new Set(out.map(r => r.folder))];
   return {rows: order.flatMap(f => out.filter(r => r.folder === f))};
@@ -859,7 +1055,7 @@ function drawPeople(){
   const c = sheetCtx, owner = isOwner();
   const sum = r2(c.rows.reduce((s,r) => s + (Number(r.share) || 0), 0));
   $("#sheetHost .sheet").innerHTML = `<div class="grab"></div>
-  <h3>Pessoas e divisão</h3><p class="sub">A porcentagem é a parte de cada um nas despesas em comum. A soma precisa dar 100%.${owner ? "" : " Só o administrador remove pessoas."}</p>
+  <h3>Pessoas e divisão padrão</h3><p class="sub">Divisão sugerida ao cadastrar uma despesa compartilhada no Meu caixa (cada despesa pode ter a sua). A soma precisa dar 100%.${owner ? "" : " Só o administrador remove pessoas."}</p>
   <form id="fp" novalidate>
     <div class="field"><label for="gN">Nome do grupo</label><input class="inp" id="gN" value="${esc(S.config.name || "")}" maxlength="30"></div>
     ${c.rows.map((r,i) => `<div class="memrow">${dot(r.id)}
@@ -888,13 +1084,12 @@ function sheetNewMonth(){
   const sug = addMonth(cur, 1);
   const opts = [0,1,2].map(d => addMonth(sug, d)).filter(k => !S.months.includes(k));
   const start = todayISO() > curStart ? todayISO() : addDays(curStart, 1);
-  openSheet(`<h3>Iniciar novo período</h3><p class="sub">Use no dia em que o pagamento cair. ${esc(monthLabel(cur))} fecha na véspera da data escolhida e os envelopes do novo período começam zerados.</p>
+  openSheet(`<h3>Iniciar novo período</h3><p class="sub">Use no dia em que o pagamento cair. ${esc(monthLabel(cur))} fecha na véspera da data escolhida. As despesas compartilhadas continuam com os mesmos valores (envelopes zerados) e o Meu caixa de cada pessoa é repetido do período anterior.</p>
   <form id="fm" novalidate>
     <div class="two">
       <div class="field"><label for="mK">Nome do período</label><select class="inp" id="mK">${opts.map(k => `<option value="${k}">${monthLabel(k)}</option>`).join("")}</select></div>
       <div class="field"><label for="mS">Começa em</label><input class="inp" type="date" id="mS" value="${esc(start)}" min="${esc(addDays(curStart, 1))}"></div>
     </div>
-    <div class="field"><label>Envelopes do novo período</label><div class="seg" data-seg="src"><button type="button" data-v="template" aria-pressed="true">Modelo padrão</button><button type="button" data-v="prev" aria-pressed="false" ${envs().length?"":"disabled"}>Iguais a ${esc(monthLabel(S.viewMonth))}</button></div></div>
     <div id="fmMove"></div>
     <p class="err" id="fmErr" hidden></p>
     <div class="btnrow"><button class="btn" type="submit">Iniciar período</button><button class="btn ghost" type="button" data-act="close">Cancelar</button></div>
@@ -920,30 +1115,113 @@ function sheetHistory(){
   openSheet(`<h3>Períodos</h3><p class="sub">Toque para ver os envelopes e o acerto de um período.</p>
   <div class="list">${list.map(k => `<button class="li" data-act="viewMonth" data-k="${esc(k)}"><div class="grow"><div class="t">${esc(monthLabel(k))}</div><div class="s">${esc(periodRange(k))}${k===S.config.currentMonth?" · ativo":""}</div></div><span class="chev">›</span></button>`).join("") || `<div class="li"><span class="s">Nenhum período ainda.</span></div>`}</div>`, {type:"history"});
 }
+/* Cadastro de renda/despesa do Meu caixa. Despesa: compartilhada (divisão própria) ou pessoal (privada);
+   pagamento único ou envelope acompanhado ao longo do período. */
+function splitPresets(){
+  const act = activeMembers();
+  const me = act.find(m => m.id === S.me), oth = act.filter(m => m.id !== S.me);
+  if (act.length === 2 && me){
+    const o = oth[0], mk = (a, b) => ({[S.me]:a, [o.id]:b});
+    return [{k:"50", sp:mk(50,50), t:"50-50"}, {k:"30", sp:mk(30,70), t:`Você 30 · ${esc(o.name)} 70`}, {k:"70", sp:mk(70,30), t:`Você 70 · ${esc(o.name)} 30`}];
+  }
+  const eq = {}, n = act.length, base = Math.floor(10000 / n) / 100;
+  act.forEach((m, i) => eq[m.id] = i === 0 ? r2(100 - base * (n - 1)) : base);
+  return [{k:"eq", sp:eq, t:"Partes iguais"}];
+}
+const sameSplit = (a, b) => { const ka = Object.keys(a).filter(k => a[k] > 0), kb = Object.keys(b).filter(k => b[k] > 0); return ka.length === kb.length && ka.every(k => Math.abs((a[k]||0) - (b[k]||0)) < 0.01); };
 function sheetLedItem(item, kind){
-  const i = item || {kind, name:"", amount:"", date:"", paid:false};
-  openSheet(`<h3>${item ? "Editar item" : (i.kind==="in" ? "Nova renda" : "Nova despesa")}</h3><p class="sub">Só você vê o seu caixa.</p>
+  const i = item || {kind, name:"", amount:"", date:"", paid:false, shared:false, mode:"once", folder:""};
+  const presets = splitPresets(), grp = shares();
+  let sp = i.split || grp, pk = presets.find(p => sameSplit(p.sp, sp));
+  const isGrp = !i.split || sameSplit(sp, grp);
+  const sel = pk ? pk.k : isGrp ? "grp" : "custom";
+  const folders = [...new Set(envs().filter(e => e.type === "comum").map(e => e.folder).filter(Boolean))];
+  const linked = item && item.shared ? envById(linkedEnvId(item.id)) : null;
+  const hasTx = linked && usedEnvIds().has(linked.id);
+  const segb = (seg, v, cur, t, dis) => `<button type="button" data-v="${esc(v)}" aria-pressed="${cur === v}" ${dis ? "disabled" : ""}>${t}</button>`;
+  openSheet(`<h3>${item ? "Editar item" : (i.kind==="in" ? "Nova renda" : "Nova despesa")}</h3><p class="sub">${esc(monthLabel(S.ledgerMonth))}. Rendas e despesas pessoais: só você vê.</p>
   <form id="fl" novalidate>
-    <div class="field"><label>Tipo</label><div class="seg" data-seg="lk"><button type="button" data-v="in" aria-pressed="${i.kind==="in"}">Renda</button><button type="button" data-v="out" aria-pressed="${i.kind!=="in"}">Despesa</button></div></div>
-    <div class="field"><label for="flN">Nome</label><input class="inp" id="flN" value="${esc(i.name)}" maxlength="60" placeholder="Ex.: Salário, Aluguel e condomínio" autofocus></div>
-    <div class="two"><div class="field"><label for="flA">Valor (R$)</label><input class="inp num" id="flA" inputmode="decimal" value="${esc(moneyInput(i.amount))}" placeholder="0,00"></div>
-    <div class="field"><label for="flD">Data (opcional)</label><input class="inp" type="date" id="flD" value="${esc(i.date||"")}"></div></div>
+    <div class="field"><label>Tipo</label><div class="seg" data-seg="lk">${segb("lk","in",i.kind,"Renda", hasTx)}${segb("lk","out",i.kind==="in"?"in":"out","Despesa")}</div></div>
+    <div class="field"><label for="flN">Nome</label><input class="inp" id="flN" value="${esc(i.name)}" maxlength="60" placeholder="Ex.: Salário, Aluguel, Mercado" autofocus></div>
+    <div class="two"><div class="field"><label for="flA" id="flAL">Valor (R$)</label><input class="inp num" id="flA" inputmode="decimal" value="${esc(moneyInput(i.amount))}" placeholder="0,00"></div>
+    <div class="field"><label for="flD">Dia (opcional)</label><input class="inp" type="date" id="flD" value="${esc(i.date||"")}"></div></div>
+    <div id="flOut">
+      <div class="field"><label>Quem paga</label><div class="seg" data-seg="sh">${segb("sh","no",i.shared?"yes":"no","Só eu (pessoal)", hasTx)}${segb("sh","yes",i.shared?"yes":"no","Compartilhada")}</div>
+        <p class="note" id="flShNote" style="margin:6px 2px 0"></p></div>
+      <div id="flSplitBox">
+        <div class="field"><label>Divisão desta despesa</label><div class="seg wrap" data-seg="sp">${presets.map(p => segb("sp", p.k, sel, p.t)).join("")}${presets.some(p => sameSplit(p.sp, grp)) ? "" : segb("sp","grp",sel,"Padrão do grupo")}${segb("sp","custom",sel,"Personalizar")}</div></div>
+        <div id="flCustom">${activeMembers().map((m, n) => `<div class="memrow" style="grid-template-columns:28px 1fr 84px">${dot(m.id)}<span>${esc(m.name)}${m.id === S.me ? " (você)" : ""}</span><input class="inp num" data-sp="${esc(m.id)}" id="sp-${n}" inputmode="decimal" value="${esc(String(r2(sp[m.id] || 0)).replace(".", ","))}" aria-label="Porcentagem de ${esc(m.name)}"></div>`).join("")}
+          <p class="note" style="margin:0 4px 10px">Porcentagens; a soma precisa dar 100%.</p></div>
+        <div class="field"><label for="flF">Pasta na tela de envelopes</label><input class="inp" id="flF" value="${esc(i.folder || "")}" list="flFolders" maxlength="40" placeholder="Ex.: Casa"><datalist id="flFolders">${folders.map(f => `<option value="${esc(f)}">`).join("")}</datalist></div>
+      </div>
+      <div class="field"><label>Como pagar</label><div class="seg" data-seg="md">${segb("md","once",i.mode||"once","Pagamento único")}${segb("md","track",i.mode||"once","Envelope no mês")}</div>
+        <p class="note" id="flMdNote" style="margin:6px 2px 0"></p></div>
+    </div>
+    ${hasTx ? `<p class="note" style="margin:0 4px 10px">Esta despesa já tem lançamentos no envelope do grupo: dá para mudar valor, nome e divisão, mas ela continua compartilhada.</p>` : ""}
     <p class="err" id="flErr" hidden></p>
     <div class="btnrow"><button class="btn" type="submit">Salvar</button><button class="btn ghost" type="button" data-act="close">Cancelar</button>${item ? `<button class="btn danger" type="button" data-act="ledDel" data-id="${esc(item.id)}">Apagar</button>` : ""}</div>
-  </form>`, {type:"led", id: item && item.id});
+  </form>`, {type:"led", id: item && item.id, presets});
+  updateLedForm();
 }
-
+function updateLedForm(){
+  if (!$("#fl")) return;
+  const out = (segVal("lk") || "out") === "out", sh = segVal("sh") === "yes", md = segVal("md") || "once", spk = segVal("sp");
+  $("#flOut").hidden = !out;
+  $("#flSplitBox").hidden = !sh;
+  $("#flCustom").hidden = spk !== "custom";
+  $("#flAL").textContent = out && sh ? "Valor total (R$)" : "Valor (R$)";
+  $("#flShNote").textContent = sh ? "Vira um envelope do grupo e aparece no Meu caixa de quem divide, com a parte de cada um. Entra no acerto." : "Fica só no seu caixa: ninguém do grupo vê.";
+  $("#flMdNote").textContent = md === "once"
+    ? (sh ? "Paga de uma vez (ex.: aluguel). Na hora, marque quem pagou." : "Paga de uma vez (ex.: aluguel, plano). Marque como pago no caixa.")
+    : (sh ? "Envelope do grupo acompanhado ao longo do mês (ex.: mercado), com barra de ritmo." : "Envelope privado acompanhado ao longo do mês (ex.: farmácia); só você vê.");
+}
+function readSplit(){
+  const k = segVal("sp");
+  if (k === "grp") return {...shares()};
+  const p = (sheetCtx.presets || []).find(x => x.k === k);
+  if (p) return {...p.sp};
+  const out = {};
+  document.querySelectorAll("[data-sp]").forEach(el => { const v = Number(String(el.value).replace(",", ".")); out[el.dataset.sp] = isFinite(v) ? v : NaN; });
+  return out;
+}
 /* ---------- escritas ---------- */
-function saveLedger(items){
-  if (!S.db || !S.uid) return;
+/* Grava o caixa e, junto, os envelopes compartilhados que nascem dele (no mesmo lote: tudo ou nada).
+   removeEnv: ids de envelopes vinculados que devem sair (item apagado ou que deixou de ser compartilhado). */
+function saveLedger(items, removeEnv = []){
+  if (!S.db || !S.uid || !S.ledgerMonth) return;
   const month = S.ledgerMonth;
   S.ledger = {...(S.ledger||{}), items}; render();
-  fire(P.ledger(month).set({month, items, updated:Date.now()}));
+  const batch = S.db.batch();
+  batch.set(P.ledger(month), {month, items, updated:Date.now()});
+  const envUpd = linkedEnvelopes(month, items, removeEnv);
+  if (envUpd) batch[envUpd.op](P.month(month), envUpd.data);
+  fire(batch.commit());
 }
-async function startPeriod(k, start, src, moveLate){
+/* Lista de envelopes do período com os envelopes das minhas despesas compartilhadas criados/atualizados.
+   Devolve null se nada mudou ou se o período não está carregado na tela. */
+function linkedEnvelopes(month, items, removeEnv){
+  if (month !== S.viewMonth || !S.monthLoaded) return null;
+  const cur = envs(), rm = new Set(removeEnv);
+  const desired = new Map(items.map(cleanItem).filter(i => i && i.kind === "out" && i.shared).map(i => [linkedEnvId(i.id), envFromItem(i)]));
+  const next = [];
+  for (const e of cur){
+    if (rm.has(e.id) && !desired.has(e.id)) continue;
+    if (desired.has(e.id) && (!e.src || e.src.uid === S.uid)){ next.push(desired.get(e.id)); desired.delete(e.id); }
+    else next.push(e);
+  }
+  next.push(...desired.values());
+  if (JSON.stringify(next) === JSON.stringify(cur)) return null;
+  if (next.length > 150) { toast("Máximo de 150 envelopes no período."); return null; }
+  const order = [...new Set(next.map(r => r.folder))];
+  const envelopes = order.flatMap(f => next.filter(r => r.folder === f));
+  return S.monthDoc ? {op:"update", data:{envelopes}} : {op:"set", data:{month, startDate:periodStart(month), envelopes, created:Date.now(), createdBy:S.uid}};
+}
+/* Novo período: as despesas compartilhadas continuam (mesmos ids, valores, divisão e forma de pagamento),
+   com os envelopes zerados. Envelopes pessoais antigos (visíveis ao grupo) não passam adiante:
+   o pessoal agora fica no Meu caixa de cada um. */
+async function startPeriod(k, start, moveLate){
   const cur = S.config.currentMonth;
-  const base = src === "prev" ? envs() : (Array.isArray(S.config.template) ? S.config.template.map(cleanEnv).filter(Boolean) : []);
-  const envelopes = base.map(e => ({id: e.id || rid(), name:e.name, folder:e.folder || "Geral", budget:r2(e.budget), type:e.type === "comum" ? "comum" : "pessoal", owner: e.type === "comum" ? null : (e.owner || S.me)}));
+  const envelopes = envs().filter(e => e.type === "comum").map(e => ({...e, budget:r2(e.budget), owner:null}));
   const batch = S.db.batch();
   batch.set(P.month(k), {month:k, startDate:start, envelopes, created:Date.now(), createdBy:S.uid});
   batch.update(P.config(), {currentMonth:k, ["periods." + k]: start});
@@ -960,8 +1238,28 @@ async function startPeriod(k, start, src, moveLate){
     }
   }
   fire(batch.commit());
-  closeSheet(); S.tab = "env"; ls.set("tab", "env"); S.ledgerTouched = false; subMonth(k); subLedger(k);
+  closeSheet(); S.tab = "env"; subMonth(k);
   toast(`${monthLabel(k)} iniciado em ${shortDate(start)}${moved ? ` · ${moved} lançamento(s) levados` : ""}`);
+}
+/* Envelopes pessoais antigos (de antes desta versão, visíveis ao grupo) → envelopes privados no Meu caixa,
+   com os gastos já lançados. Envelope com transferências ou valores extras fica como está. */
+function migratePersonal(){
+  const mine = envs().filter(e => e.type === "pessoal" && e.owner === S.me);
+  const items = [...ledItems()], keep = [], batch = S.db.batch();
+  let writes = 2, n = 0;
+  for (const e of mine){
+    const txs = S.tx.filter(t => t.env === e.id || t.from === e.id || t.to === e.id);
+    if (txs.some(t => t.kind !== "expense") || writes + txs.length > 480 || items.length >= 300){ keep.push(e.id); continue; }
+    items.push({id:rid(), kind:"out", name:e.name, amount:r2(e.budget), date:"", paid:false, shared:false, mode:"track", folder:"",
+      spends: txs.map(t => ({id:rid(), amount:r2(t.amount), desc:String(t.desc || "").slice(0,80), date: isISO(t.date) ? t.date : "", ts:Number(t.ts) || 0}))});
+    for (const t of txs) batch.delete(P.tx(S.viewMonth).doc(t.id));
+    writes += txs.length; n++;
+  }
+  if (!n) return toast("Nada para trazer: esses envelopes têm transferências ou valores extras.");
+  const gone = new Set(mine.map(e => e.id).filter(id => !keep.includes(id)));
+  batch.set(P.ledger(S.viewMonth), {month:S.viewMonth, items, updated:Date.now()});
+  batch.update(P.month(S.viewMonth), {envelopes: envs().filter(e => !gone.has(e.id))});
+  fire(batch.commit(), `${n} ${n===1?"envelope trazido":"envelopes trazidos"} para o seu caixa${keep.length ? ` (${keep.length} ficaram no grupo)` : ""}`);
 }
 function undoPeriod(){
   const cur = S.config.currentMonth, prev = S.months.filter(x => x < cur).pop();
@@ -970,16 +1268,16 @@ function undoPeriod(){
   batch.update(P.config(), {currentMonth:prev, ["periods." + cur]: firebase.firestore.FieldValue.delete()});
   batch.delete(P.month(cur));
   fire(batch.commit(), `Voltou para ${monthLabel(prev)}`);
-  subMonth(prev); subLedger(prev);
+  subMonth(prev);
 }
 
 /* ---------- eventos ---------- */
 document.addEventListener("click", async ev => {
   const segBtn = ev.target.closest(".seg button");
-  if (segBtn && !segBtn.disabled){ segBtn.parentElement.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", b === segBtn)); return; }
+  if (segBtn && !segBtn.disabled){ segBtn.parentElement.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", b === segBtn)); if (segBtn.closest("#fl")) updateLedForm(); return; }
   if (ev.target.id === "scrim"){ closeSheet(); return; }
   const nav = ev.target.closest("#nav button");
-  if (nav){ S.tab = nav.dataset.tab; ls.set("tab", S.tab); window.scrollTo(0,0); render(); return; }
+  if (nav){ S.tab = nav.dataset.tab; window.scrollTo(0,0); render(); return; }
   const el = ev.target.closest("[data-act]"); if (!el) return;
   const a = el.dataset.act, id = el.dataset.id, k = el.dataset.k;
   switch(a){
@@ -1027,7 +1325,15 @@ document.addEventListener("click", async ev => {
       if (!(parseMoney(amt.value) > 0)) amt.focus();
       else if (document.activeElement && document.activeElement.blur) document.activeElement.blur();   // fecha o teclado: falta só "Lançar gasto"
       break; }
-    case "spendIn": sheetExpense(null, id); break;
+    case "spendIn": { const e = envAny(id); if (e && e.mode === "once") { const st = envStats()[id]; sheetExpense(null, id, st && st.left > 0 ? st.left : ""); } else sheetExpense(null, id); break; }
+    case "payEnv": { const e = envById(id); if (!e) break; const st = envStats()[id];
+      if (st.avail > 0 && st.left <= 0.004) sheetEnvelope(id); else sheetExpense(null, id, st.left > 0 ? st.left : ""); break; }
+    case "openPSpend": { const it = ledItems().find(i => i.id === id), sp = it && (it.spends || []).find(x => x.id === k); if (!sp) break;
+      sheetExpense({kind:"expense", private:true, item:it.id, sid:sp.id, amount:sp.amount, desc:sp.desc, date:sp.date, ts:sp.ts, env:"p:" + it.id}); break; }
+    case "goLed": S.tab = "led"; window.scrollTo(0,0); render(); break;
+    case "askMigrate": $("#migBox").innerHTML = `<div class="confirm" style="margin-bottom:12px"><p>Os envelopes pessoais saem da tela do grupo e viram envelopes privados no seu caixa, com os gastos já lançados. Ninguém mais os verá. Continuar?</p><div class="btnrow"><button class="btn" data-act="doMigrate">Trazer para o caixa</button><button class="btn ghost" data-act="noMigrate">Agora não</button></div></div>`; break;
+    case "noMigrate": $("#migBox").innerHTML = ""; break;
+    case "doMigrate": migratePersonal(); break;
     case "transferFrom": sheetTransfer(null, id); break;
     case "extraIn": sheetExtra(null, id); break;
     case "transfer": if (envs().length < 2) { toast("Crie pelo menos dois envelopes para transferir."); break; } sheetTransfer(); break;
@@ -1035,18 +1341,18 @@ document.addEventListener("click", async ev => {
     case "openTx": { const t = S.tx.find(x => x.id === id); if (!t) break; ({expense:sheetExpense, transfer:sheetTransfer, extra:sheetExtra}[t.kind] || sheetExpense)(t); break; }
     case "askDel": $("#delBox").innerHTML = `<div class="confirm"><p>Apagar este lançamento? O valor volta para o envelope.</p><div class="btnrow"><button class="btn danger" type="button" data-act="doDel">Sim, apagar</button><button class="btn ghost" type="button" data-act="noDel">Manter</button></div></div>`; break;
     case "noDel": $("#delBox").innerHTML = ""; break;
-    case "doDel": { const tid = sheetCtx && sheetCtx.id; if (!tid) break; closeSheet(); fire(P.tx(S.viewMonth).doc(tid).delete(), "Lançamento apagado"); break; }
+    case "doDel": { const c = sheetCtx, tid = c && c.id; if (!tid) break; closeSheet();
+      if (c.private){ saveLedger(ledItems().map(i => i.id === c.item ? {...i, spends:(i.spends || []).filter(x => x.id !== tid)} : i)); toast("Gasto apagado"); break; }
+      fire(P.tx(S.viewMonth).doc(tid).delete(), "Lançamento apagado"); break; }
     case "newMonth":
       if (S.viewMonth !== S.config.currentMonth) subMonth(S.config.currentMonth);
       sheetNewMonth(); break;
-    case "editMonth": if (!S.monthDoc){ sheetEditor("month", true); break; } sheetEditor("month"); break;
-    case "editMonthFromTemplate": sheetEditor("month", true); break;
-    case "editTemplate": sheetEditor("template"); break;
+    case "editMonth": sheetEditor("month"); break;
     case "history": sheetHistory(); break;
     case "viewMonth": closeSheet(); subMonth(k); S.tab = "env"; render(); break;
     case "edAdd": readEditorInputs(); sheetCtx.rows.push({id:rid(), name:"", folder: (sheetCtx.rows[sheetCtx.rows.length-1]||{}).folder || "", budget:0, type:"comum", owner:null}); drawEditor(); setTimeout(() => { const n = $(`#ed-n-${sheetCtx.rows.length-1}`); n && n.focus(); }, 30); break;
     case "edDel": readEditorInputs(); sheetCtx.rows.splice(+el.dataset.i, 1); drawEditor(); break;
-    case "edSave": case "edToTemplate": {
+    case "edSave": {
       const res = cleanRows();
       if (res.error){ const e = $("#edErr"); e.hidden = false; e.textContent = res.error; break; }
       const rows = res.rows, mode = sheetCtx.mode;
@@ -1055,44 +1361,31 @@ document.addEventListener("click", async ev => {
         if (lost.length){ const e = $("#edErr"); e.hidden = false; e.textContent = "Um envelope com lançamentos sumiu da lista. Cancele e tente de novo."; break; }
       }
       closeSheet();
-      if (mode === "template") fire(P.config().update({template:rows}), "Modelo salvo");
-      else {
-        const k2 = S.viewMonth;
-        fire(S.monthDoc ? P.month(k2).update({envelopes:rows}) : P.month(k2).set({month:k2, startDate:periodStart(k2), envelopes:rows, created:Date.now(), createdBy:S.uid}), a === "edToTemplate" ? "Período e modelo salvos" : "Envelopes salvos");
-        if (a === "edToTemplate") fire(P.config().update({template:rows.map(r => ({...r}))}));
-      }
+      const k2 = S.viewMonth;
+      fire(S.monthDoc ? P.month(k2).update({envelopes:rows}) : P.month(k2).set({month:k2, startDate:periodStart(k2), envelopes:rows, created:Date.now(), createdBy:S.uid}), "Envelopes salvos");
       break; }
     case "settle": { const z = settlement(); fire(P.month(S.viewMonth).update({settlement:{transfers:z.transfers, total:z.total, date:todayISO(), by:S.uid}}), "Acerto registrado"); break; }
     case "unsettle": fire(P.month(S.viewMonth).update({settlement:null})); break;
     case "ledAdd": sheetLedItem(null, k); break;
     case "ledEdit": { const it = ledItems().find(i => i.id === id); if (it) sheetLedItem(it); break; }
     case "ledPaid": saveLedger(ledItems().map(i => i.id === id ? {...i, paid:!i.paid} : i)); break;
-    case "ledDel": closeSheet(); saveLedger(ledItems().filter(i => i.id !== id)); toast("Item apagado"); break;
-    case "ledCopy": {
-      const target = S.ledgerMonth, pk = addMonth(target, -1);
-      try {
-        const s = await P.ledger(pk).get();
-        const prev = s.exists && Array.isArray(s.data().items) ? s.data().items : [];
-        if (!prev.length){ toast(`${monthLabel(pk)} não tem itens`); break; }
-        if (S.ledgerMonth !== target || ledItems().length) break;
-        const max = daysIn(target);
-        const items = prev.map(i => ({...i, id:rid(), paid:false, date: isISO(i.date) ? `${target}-${pad(Math.min(+i.date.slice(8,10) || 1, max))}` : ""}));
-        saveLedger(items); toast(`${items.length} itens copiados`);
-      } catch { toast("Não deu para ler o mês anterior."); }
-      break; }
+    case "ledDel": {
+      const it = ledItems().find(i => i.id === id); if (!it) { closeSheet(); break; }
+      const eid = linkedEnvId(id);
+      if (it.shared && usedEnvIds().has(eid)){ const e = $("#flErr"); if (e){ e.hidden = false; e.textContent = "Esta despesa já tem lançamentos no envelope do grupo. Apague os lançamentos antes (aba Lançamentos)."; } break; }
+      closeSheet(); saveLedger(ledItems().filter(i => i.id !== id), it.shared ? [eid] : []); toast("Item apagado"); break; }
+    case "ledCopy": copyLedgerFromPrev(S.ledgerMonth, false); break;
   }
 });
-document.addEventListener("change", ev => { if (ev.target.id === "mS") updateMoveHint(); if (ev.target.id === "fxEnv") drawSugs(); });
+document.addEventListener("change", ev => { if (ev.target.id === "mS") updateMoveHint(); if (ev.target.id === "fxEnv"){ const b = $("#fxByBox"); if (b) b.hidden = isPriv(ev.target.value); drawSugs(); } });
 // ao corrigir qualquer campo, a mensagem de erro antiga do formulário some
 document.addEventListener("input", ev => { const f = ev.target.closest("form, .sheet"); const e = f && f.querySelector(".err"); if (e) e.hidden = true; if (ev.target.id === "fxDesc") drawSugs(); });
 
-$("#whoBtn").addEventListener("click", () => { S.tab = "set"; ls.set("tab","set"); render(); });
+$("#whoBtn").addEventListener("click", () => { S.tab = "set"; render(); });
 $("#prevM").addEventListener("click", () => {
-  if (S.tab === "led"){ S.ledgerTouched = true; return subLedger(addMonth(S.ledgerMonth, -1)); }
   const i = S.months.indexOf(S.viewMonth); if (i > 0) subMonth(S.months[i-1]);
 });
 $("#nextM").addEventListener("click", () => {
-  if (S.tab === "led"){ S.ledgerTouched = true; return subLedger(addMonth(S.ledgerMonth, 1)); }
   const i = S.months.indexOf(S.viewMonth); if (i >= 0 && i < S.months.length-1) subMonth(S.months[i+1]);
 });
 $("#fab").addEventListener("click", () => { if (S.tab === "led") sheetLedItem(null, "out"); else sheetExpense(); });
@@ -1137,8 +1430,18 @@ document.addEventListener("submit", async ev => {
       const date = $("#fxDate").value || defaultDate(S.viewMonth);
       const ps = periodStart(S.viewMonth), pe = periodEnd(S.viewMonth);
       if (!isISO(date) || date < ps || (pe && date > pe)) return err("#fxErr", `A data precisa estar dentro de ${monthLabel(S.viewMonth)} (${periodRange(S.viewMonth)}). Para outro período, troque no topo da tela.`);
-      data = {kind:"expense", amount, env:$("#fxEnv").value, desc, date, by: whoVal() || S.me};
-      if (!data.env) return err("#fxErr", "Escolha um envelope.");
+      const env = $("#fxEnv").value;
+      if (!env) return err("#fxErr", "Escolha um envelope.");
+      if (isPriv(env)){
+        // envelope privado: o gasto fica no Meu caixa (só a dona vê), nunca no grupo
+        const it = privItem(env); if (!it) return err("#fxErr", "Envelope não encontrado.");
+        if (!c.id && (it.spends || []).length >= 200) return err("#fxErr", "Máximo de 200 gastos neste envelope.");
+        const sp = {id: c.id || rid(), amount, desc, date, ts: c.id ? ((it.spends.find(x => x.id === c.id) || {}).ts || Date.now()) : Date.now()};
+        const items = ledItems().map(i => i.id !== it.id ? i : {...i, spends: c.id ? i.spends.map(x => x.id === c.id ? sp : x) : [...i.spends, sp]});
+        closeSheet(); saveLedger(items); toast(c.id ? "Salvo" : "Gasto lançado 🔒");
+        return;
+      }
+      data = {kind:"expense", amount, env, desc, date, by: whoVal() || S.me};
     } else if (c.kind === "transfer"){
       const from = $("#fxFrom").value, to = $("#fxTo").value;
       if (!from || !to || from === to) return err("#fxErr", "Escolha envelopes diferentes em “De” e “Para”.");
@@ -1165,16 +1468,15 @@ document.addEventListener("submit", async ev => {
     closeSheet(); fire(P.config().update(upd), "Salvo");
   }
   else if (f.id === "fm"){
-    const k = $("#mK").value, start = $("#mS").value, src = segVal("src") || "template";
+    const k = $("#mK").value, start = $("#mS").value;
     const cur = S.config.currentMonth, curStart = periodStart(cur);
     if (!isKey(k)) return err("#fmErr", "Escolha o nome do período.");
     if (S.months.includes(k)) return err("#fmErr", `${monthLabel(k)} já existe.`);
     if (!isISO(start) || start <= curStart) return err("#fmErr", `A data de início precisa ser depois de ${shortDate(curStart)} (início de ${monthLabel(cur)}).`);
     if (diffDays(todayISO(), start) > 31) return err("#fmErr", "A data de início está muito no futuro. Inicie o período no dia em que o pagamento cair.");
-    if (src === "template" && !(S.config.template || []).length) return err("#fmErr", "O modelo está vazio. Crie as pastas e envelopes padrão em Ajustes.");
     const chk = $("#fmMoveChk");
     f.querySelector("button[type=submit]").disabled = true;
-    await startPeriod(k, start, src, !!(chk && chk.checked));
+    await startPeriod(k, start, !!(chk && chk.checked));
   }
   else if (f.id === "fl"){
     const name = $("#flN").value.trim().slice(0,60), amount = parseMoney($("#flA").value), kind = segVal("lk") || "out";
@@ -1183,14 +1485,42 @@ document.addEventListener("submit", async ev => {
     const c = sheetCtx, items = [...ledItems()];
     if (!c.id && items.length >= 300) return err("#flErr", "Máximo de 300 itens por mês.");
     const date = $("#flD").value || "";
-    if (c.id){ const i = items.findIndex(x => x.id === c.id); if (i >= 0) items[i] = {...items[i], name, amount, kind, date}; }
-    else items.push({id:rid(), name, amount, kind, date, paid:false});
+    const old = c.id ? items.find(x => x.id === c.id) : null;
+    let it = {...(old || {id:rid(), paid:false}), name, amount, kind, date};
+    let removeEnv = [];
+    if (kind === "in"){ for (const k2 of ["shared","mode","split","folder","spends"]) delete it[k2]; }
+    else {
+      const shared = segVal("sh") === "yes", mode = segVal("md") === "track" ? "track" : "once";
+      it.shared = shared; it.mode = mode; it.spends = (old && old.spends) || [];
+      if (shared){
+        const sp = readSplit(), vals = Object.values(sp);
+        if (vals.some(v => !(v >= 0 && v <= 100))) return err("#flErr", "Use porcentagens entre 0 e 100.");
+        const sum = vals.reduce((a2, v) => a2 + v, 0);
+        if (Math.abs(sum - 100) > 0.05) return err("#flErr", `A divisão soma ${shareLabel(sum)}. Ajuste até dar 100%.`);
+        it.split = cleanSplit(sp); it.folder = ($("#flF").value || "").trim().slice(0,40);
+        if (!it.split) return err("#flErr", "Divisão inválida.");
+        if (it.spends.length) return err("#flErr", "Este envelope privado já tem gastos. Apague-os antes de torná-lo compartilhado.");
+      } else {
+        delete it.split;
+        if (old && old.shared){
+          if (usedEnvIds().has(linkedEnvId(old.id))) return err("#flErr", "Esta despesa já tem lançamentos no envelope do grupo, então continua compartilhada.");
+          removeEnv = [linkedEnvId(old.id)];
+        }
+        if (mode === "once" && it.spends.length) return err("#flErr", "Este envelope privado já tem gastos. Apague-os antes de mudar para pagamento único.");
+      }
+    }
+    if (old && old.shared && kind === "in"){
+      if (usedEnvIds().has(linkedEnvId(old.id))) return err("#flErr", "Esta despesa já tem lançamentos no envelope do grupo.");
+      removeEnv = [linkedEnvId(old.id)];
+    }
+    if (old){ const i = items.findIndex(x => x.id === old.id); items[i] = it; } else items.push(it);
     items.sort((x,y) => (x.kind===y.kind?0:x.kind==="in"?-1:1));
-    closeSheet(); saveLedger(items); toast("Salvo");
+    closeSheet(); saveLedger(items, removeEnv);
+    toast(kind === "out" && it.shared ? "Salvo · envelope compartilhado atualizado" : "Salvo");
   }
 });
 
-window.__orc = {S, envStats, settlement, parseMoney, status, periodFrac, periodStart, periodEnd, expectedEnd, defaultDate, shares, money, esc, normTxt, buildSuggestPool, suggest, leftFrac, overFrac};
+window.__orc = {S, envStats, settlement, splitCents, cleanSplit, cleanItem, envSplit, linkedEnvelopes, privStats, parseMoney, status, periodFrac, periodStart, periodEnd, expectedEnd, defaultDate, shares, money, esc, normTxt, buildSuggestPool, suggest, leftFrac, overFrac};
 boot();
 if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost") && !window.FIREBASE_EMULATOR) {
   window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
