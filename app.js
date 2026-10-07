@@ -15,7 +15,7 @@ const r2 = n => Math.round(((Number(n) || 0) + Number.EPSILON) * 100) / 100;
 const money = n => fmtBRL.format(r2(n)).replace(/ /g, " ");
 const MAX_AMOUNT = 10000000;
 /* Versão mostrada em Ajustes. AO PUBLICAR: aumente aqui e o VERSION do sw.js (veja REFERENCIA.txt, seção 7). */
-const APP_VERSION = "6.3.0";
+const APP_VERSION = "6.4.0";
 function parseMoney(s){
   s = String(s ?? "").trim().replace(/[R$\s ]/g, "");
   if (!s) return NaN;
@@ -663,15 +663,15 @@ function allStats(){
 }
 function viewEnvelopes(){
   if (!S.monthLoaded) return `<div class="empty"><h3>Carregando ${esc(monthLabel(S.viewMonth))}…</h3><p>Os envelopes aparecem em instantes.</p></div>`;
-  const group = envs(), priv = privEnvs();
-  if (!group.length && !priv.length) return pastBanner() + `<div class="empty"><h3>Nenhum envelope em ${esc(monthLabel(S.viewMonth))}</h3><p>Os envelopes nascem do Meu caixa: cadastre lá as despesas do mês. As compartilhadas aparecem aqui para todo o grupo; as pessoais com acompanhamento, só para você.</p><button class="btn" data-act="goLed">Abrir Meu caixa</button></div>`;
+  // Pagamentos únicos e parcelas ficam só no Meu caixa (v6.4); aqui, só envelopes acompanhados.
+  const group = envs(), priv = privEnvs(), trackG = group.filter(e => e.mode !== "once");
+  if (!trackG.length && !priv.length) return pastBanner() + `<div class="empty"><h3>Nenhum envelope em ${esc(monthLabel(S.viewMonth))}</h3><p>Os envelopes nascem do Meu caixa: cadastre lá as despesas do mês com “Envelope no mês”. Pagamentos únicos e parcelas ficam no Meu caixa. As compartilhadas aparecem aqui para todo o grupo; as pessoais com acompanhamento, só para você.</p><button class="btn" data-act="goLed">Abrir Meu caixa</button></div>`;
   const st = allStats(), k = S.viewMonth, frac = periodFrac(k);
   const f = S.filter === "comum" || S.filter === "mine" ? S.filter : "all";
   const keep = e => f === "all" ? true : f === "comum" ? e.type === "comum" : (e.private || (e.type === "pessoal" && e.owner === S.me));
-  const tracked = [...group.filter(e => e.mode !== "once"), ...priv].filter(keep);
-  const once = group.filter(e => e.mode === "once").filter(keep);
+  const tracked = [...trackG, ...priv].filter(keep);
   let tAvail = 0, tSpent = 0;
-  for (const e of [...tracked, ...once]){ tAvail += st[e.id].avail; tSpent += st[e.id].spent; }
+  for (const e of tracked){ tAvail += st[e.id].avail; tSpent += st[e.id].spent; }
   tAvail = r2(tAvail); tSpent = r2(tSpent);
   const tLeft = r2(tAvail - tSpent);
   const closed = !!periodEnd(k), exp = expectedEnd(k), t = todayISO();
@@ -682,15 +682,14 @@ function viewEnvelopes(){
   const folders = [];
   for (const e of tracked){ const fk = e.folder || "Sem pasta"; let g = folders.find(x => x.k === fk); if (!g) folders.push(g = {k:fk, items:[], priv:!!e.private}); g.items.push(e); }
   const fl = (key, txt) => `<button class="chip" data-act="filter" data-k="${esc(key)}" aria-pressed="${f===key}">${esc(txt)}</button>`;
-  const hasMine = priv.length || group.some(e => e.type === "pessoal" && e.owner === S.me);
+  const hasMine = priv.length || trackG.some(e => e.type === "pessoal" && e.owner === S.me);
   return pastBanner() + `
   <div class="chips" role="group" aria-label="Filtro">${fl("all","Todos")}${fl("comum","Compartilhados")}${hasMine ? fl("mine","Só meus") : ""}</div>
   ${folders.map(g => {
     const gl = r2(g.items.reduce((s,e) => s + st[e.id].left, 0));
     return `<section class="folder"><div class="folder-h"><h2>${esc(g.k)}${g.priv ? ` <span class="lock" title="Só você vê">🔒</span>` : ""}</h2><span class="num">${plain(gl)}</span></div><div class="card">${g.items.map(e => envRow(e, st[e.id], frac)).join("")}</div></section>`;
   }).join("")}
-  ${once.length ? `<section class="folder"><div class="folder-h"><h2>Pagamentos únicos</h2><span class="num">${plain(r2(once.reduce((s,e) => s + Math.max(0, st[e.id].left), 0)))}</span></div><div class="card">${once.map(e => onceRow(e, st[e.id])).join("")}</div></section>` : ""}
-  ${!folders.length && !once.length ? `<div class="empty"><p>Nenhum envelope neste filtro.</p></div>` : ""}
+  ${!folders.length ? `<div class="empty"><p>Nenhum envelope neste filtro.</p></div>` : ""}
   <section class="summary" style="margin-top:4px">
     <div class="row1">
       <div><div class="lbl">Disponível agora</div><div class="big num ${tLeft<0?"neg":""}">${money(tLeft)}</div></div>
@@ -702,24 +701,11 @@ function viewEnvelopes(){
       <div><div class="lbl">Usado</div><div class="v num">${tAvail>0?Math.round(tSpent/tAvail*100):0}%</div></div>
     </div>
   </section>
-  <p class="note" style="margin:-2px 4px 12px">Toque num envelope para lançar um gasto; ⋯ abre os detalhes. Valores e divisão de cada despesa se definem no Meu caixa. 🔒 = só você vê.</p>
+  <p class="note" style="margin:-2px 4px 12px">Toque num envelope para lançar um gasto; ⋯ abre os detalhes. Valores e divisão de cada despesa se definem no Meu caixa, onde também ficam os pagamentos únicos e as parcelas. 🔒 = só você vê.</p>
   ${group.length ? `<div class="btnrow" style="margin-top:6px"><button class="btn ghost" data-act="transfer">Transferir entre envelopes</button><button class="btn ghost" data-act="extra">Acrescentar valor</button></div>` : ""}`;
 }
-/* Pagamento único (ex.: aluguel): uma linha com quem pagou; tocar registra o pagamento já com o valor que falta. */
+/* Quem pagou um pagamento único (usado no Meu caixa e nos detalhes). */
 function payersOf(envId){ const w = [...new Set(S.tx.filter(t => t.kind === "expense" && t.env === envId).map(t => t.by))]; return w.map(nameOf).join(", "); }
-function onceRow(e, s){
-  const paid = s.avail > 0 ? s.left <= 0.004 : s.spent > 0;
-  const part = s.spent > 0 && !paid;
-  const sub = (e.inst ? `Parcela ${e.inst.n}/${e.inst.of} · ` : "") + (paid ? `Pago por ${esc(payersOf(e.id))}` : part ? `Pago ${plain(s.spent)} por ${esc(payersOf(e.id))} · falta ${plain(s.left)}` : "A pagar");
-  return `<div class="env ${paid ? "good" : "none"}">
-    <button class="env-go once" data-act="payEnv" data-id="${esc(e.id)}" aria-label="${esc(e.name)}: ${paid ? "pago" : "registrar pagamento"}">
-      <span class="nm"><span class="check sm ${paid ? "on" : ""}" aria-hidden="true"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5 9-10"/></svg></span><span class="name">${esc(e.name)}</span></span>
-      <span class="amt num">${plain(s.avail)}</span>
-      <span class="of" style="text-align:left;white-space:normal">${sub}</span>
-    </button>
-    <button class="env-more" data-act="openEnv" data-id="${esc(e.id)}" aria-label="Detalhes de ${esc(e.name)}"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button>
-  </div>`;
-}
 /* Linha compacta: toque na linha = lançar gasto; botão ⋯ = detalhes do envelope.
    A barra mostra o que RESTA (cheia no início, esvazia com os gastos).
    O traço do ritmo anda da direita para a esquerda: barra à esquerda do traço = gastando mais rápido que o período passa. */
@@ -867,13 +853,27 @@ function ledgerTotals(){
   let future = 0;
   for (const i of pers) if (i.inst) future = r2(future + r2(i.amount * (i.inst.of - i.inst.n)));
   for (const r of shared) if (r.inst) future = r2(future + r2(r.part * (r.inst.of - r.inst.n)));
-  return {items, inc, pers, shared, sharedInc, RS, R, rec, DP, DS, D, saldo:r2(R - D), future};
+  // Resta a pagar (v6.4): o que ainda falta sair neste período.
+  //  - pagamento único/parcela: o que falta pagar (pessoal: valor, se não marcado "pago");
+  //  - envelope: o que resta no envelope (estourado conta 0);
+  //  - compartilhadas: só a minha % do que falta; sem envelope criado ainda, a minha parte inteira.
+  let restOnce = 0, restEnv = 0;
+  for (const i of pers){
+    if (i.mode === "track") restEnv = r2(restEnv + Math.max(0, privStats(i).left));
+    else if (!i.paid) restOnce = r2(restOnce + r2(i.amount));
+  }
+  for (const r of shared){
+    const left = r.st ? Math.max(0, r.st.left) : r.total;
+    const mine = r2(left * r.pct / 100);
+    if (r.mode === "once") restOnce = r2(restOnce + mine); else restEnv = r2(restEnv + mine);
+  }
+  return {items, inc, pers, shared, sharedInc, RS, R, rec, DP, DS, D, saldo:r2(R - D), future, restOnce, restEnv, rest:r2(restOnce + restEnv)};
 }
 function viewLedger(){
   if (!S.uid) return `<div class="empty"><h3>Caixa pessoal indisponível</h3><p>Entre com sua conta para guardar rendas e despesas só suas.</p></div>`;
   if (!S.ledgerMonth) return `<div class="empty"><h3>Nenhum período aberto</h3><p>Inicie um período em Ajustes para montar o caixa.</p></div>`;
   if (!S.ledgerLoaded) return `<div class="empty"><h3>Abrindo seu caixa…</h3></div>`;
-  const {items, inc, pers, shared, sharedInc, RS, R, rec, DP, DS, D, saldo, future} = ledgerTotals();
+  const {items, inc, pers, shared, sharedInc, RS, R, rec, DP, DS, D, saldo, future, rest, restOnce, restEnv} = ledgerTotals();
   const legacy = envs().filter(e => e.type === "pessoal" && e.owner === S.me);
 
   const incRow = i => `<div class="lrow ${i.paid?"paid":""}">
@@ -934,6 +934,7 @@ function viewLedger(){
     <div class="ls hero"><div class="lbl">Sobra do período</div><div class="v num" style="color:${saldo<0?"var(--bad)":"var(--good)"}">${saldo<0?"−":"+"} ${money(Math.abs(saldo))}</div><div style="font-size:12px;color:var(--muted)">Rendas menos despesas (das compartilhadas, só a sua parte). Visível só para você.</div></div>
     <div class="ls"><div class="lbl">Renda</div><div class="v num" style="color:var(--good)">${money(R)}</div><div style="font-size:12px;color:var(--muted)">${RS ? `Compartilhadas ${money(RS)} · pessoais ${money(r2(R - RS))}` : `Recebido ${money(rec)}`}</div></div>
     <div class="ls"><div class="lbl">Despesas</div><div class="v num" style="color:var(--bad)">${money(D)}</div><div style="font-size:12px;color:var(--muted)">Compartilhadas ${money(DS)} · pessoais ${money(DP)}${future ? `<br>Parcelas nos próximos períodos ${money(future)}` : ""}</div></div>
+    ${D > 0 ? `<div class="ls hero"><div class="lbl">Resta a pagar</div><div class="v num" style="font-size:24px;color:${rest>0?"var(--bad)":"var(--good)"}">${money(rest)}</div><div style="font-size:12px;color:var(--muted)">Pagamentos únicos ${money(restOnce)} · envelopes ${money(restEnv)}. Das compartilhadas, só a sua parte do que falta.</div></div>` : ""}
   </div>
   ${nothing ? "" : exportBar("led")}
   ${nothing ? `<div class="empty"><h3>Caixa de ${esc(monthLabel(S.ledgerMonth))} vazio</h3><p>Lance rendas e todas as despesas do mês. As compartilhadas viram envelopes do grupo; as pessoais ficam só com você.</p>
@@ -1045,6 +1046,7 @@ function ledgerReport(){
     rows:inst.map(x => [x.name, `${x.ins.n} de ${x.ins.of}`, x.v, String(x.ins.of - x.ins.n), r2(x.v * (x.ins.of - x.ins.n)), monthLabel(addMonth(k, x.ins.of - x.ins.n))]), total:true});
   const summary = [["Sobra do período", T.saldo], ["Renda", T.R], ["Despesas", T.D], ["Compartilhadas (sua parte)", T.DS], ["Pessoais", T.DP]];
   if (T.future) summary.push(["Parcelas nos próximos períodos", T.future]);
+  summary.push(["Resta a pagar", T.rest], ["Pagamentos únicos a pagar", T.restOnce], ["Restante nos envelopes", T.restEnv]);
   return {file:`meu-caixa-${k}-${slug(nameOf(S.me))}`, title:`Meu caixa · ${monthLabel(k)}`,
     sub:[`${nameOf(S.me)} · ${groupName()} · período ${periodRange(k)}`, `Gerado em ${nowLabel()}. Documento pessoal: inclui despesas que só você vê. Valores em R$.`],
     lines:[], summary, sections};
